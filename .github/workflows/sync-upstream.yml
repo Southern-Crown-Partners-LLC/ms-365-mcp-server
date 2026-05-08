@@ -1,0 +1,76 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '0 13 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: scp-main
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/softeria/ms-365-mcp-server.git
+          git fetch upstream main
+
+      - name: Check if behind
+        id: check
+        run: |
+          BEHIND=$(git rev-list --count HEAD..upstream/main)
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          echo "scp-main is $BEHIND commits behind upstream/main"
+
+      - name: Open or update sync PR
+        if: steps.check.outputs.behind != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BEHIND: ${{ steps.check.outputs.behind }}
+        run: |
+          set -euo pipefail
+          DATE=$(date +%Y-%m-%d)
+          BRANCH="sync/upstream-$DATE"
+
+          git checkout -B "$BRANCH"
+
+          CONFLICT_NOTE=""
+          if ! git merge --no-edit --no-ff upstream/main; then
+            CONFLICT_NOTE="**Merge had conflicts** — this branch has unresolved conflict markers. Resolve manually before merging."
+            git add -A
+            git commit -m "Sync upstream ($DATE) — conflicts present, requires manual resolution"
+          fi
+
+          git push -f origin "$BRANCH"
+
+          EXISTING=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number' || echo "")
+          if [ -z "$EXISTING" ]; then
+            BODY=$(cat <<EOF
+          Automatic weekly sync from \`softeria/ms-365-mcp-server\`. **$BEHIND** new commits on upstream/main.
+
+          $CONFLICT_NOTE
+
+          Upstream changes: https://github.com/softeria/ms-365-mcp-server/commits/main
+
+          Review the diff and merge if safe. Close this PR to skip — a fresh one opens next Monday.
+          EOF
+          )
+            gh pr create --base scp-main --head "$BRANCH" \
+              --title "Sync from softeria/main ($DATE)" \
+              --body "$BODY"
+          else
+            echo "PR #$EXISTING already open for $BRANCH"
+          fi

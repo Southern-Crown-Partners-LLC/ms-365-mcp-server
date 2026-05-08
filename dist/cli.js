@@ -1,0 +1,115 @@
+import { Command, Option } from "commander";
+import { readFileSync } from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+import { getCombinedPresetPattern, listPresets, presetRequiresOrgMode } from "./tool-categories.js";
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const packageJsonPath = path.join(__dirname, "..", "package.json");
+const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8"));
+const version = packageJson.version;
+const program = new Command();
+program.name("ms-365-mcp-server").description("Microsoft 365 MCP Server").version(version).option("-v", "Enable verbose logging").option("--login", "Login to Microsoft account").option("--logout", "Log out and clear saved credentials").option("--verify-login", "Verify login without starting the server").option("--list-accounts", "List all cached accounts").option("--select-account <accountId>", "Select a specific account by ID").option("--remove-account <accountId>", "Remove a specific account by ID").option("--read-only", "Start server in read-only mode, disabling write operations").option(
+  "--http [address]",
+  'Use Streamable HTTP transport instead of stdio. Format: [host:]port (e.g., "localhost:3000", ":3000", "3000"). Default: all interfaces on port 3000'
+).option(
+  "--enable-auth-tools",
+  "Enable login/logout tools when using HTTP mode (disabled by default in HTTP mode)"
+).option(
+  "--enabled-tools <pattern>",
+  'Filter tools using regex pattern (e.g., "excel|contact" to enable Excel and Contact tools)'
+).option(
+  "--preset <names>",
+  "Use preset tool categories (comma-separated). Available: mail, calendar, files, personal, work, excel, contacts, tasks, onenote, search, users, all"
+).option("--list-presets", "List all available presets and exit").option("--list-permissions", "List all required Graph API permissions and exit").option(
+  "--org-mode",
+  "Enable organization/work mode from start (includes Teams, SharePoint, etc.)"
+).option("--work-mode", "Alias for --org-mode").option("--force-work-scopes", "Backwards compatibility alias for --org-mode (deprecated)").option("--toon", "(experimental) Enable TOON output format for 30-60% token reduction").option("--discovery", "Enable runtime tool discovery and loading (experimental feature)").option("--cloud <type>", "Microsoft cloud environment: global (default) or china (21Vianet)").option(
+  "--enable-dynamic-registration",
+  "Enable OAuth Dynamic Client Registration endpoint (kept for backwards compatibility, now enabled by default in HTTP mode)"
+).option(
+  "--no-dynamic-registration",
+  "Disable OAuth Dynamic Client Registration endpoint in HTTP mode"
+).option(
+  "--auth-browser",
+  "Use browser-based interactive OAuth flow instead of device code for stdio mode. Opens system browser with localhost callback for seamless sign-in."
+).option(
+  "--public-url <url>",
+  "Public base URL (e.g. https://mcp.example.com) used in browser-facing OAuth redirects when running behind a reverse proxy. Server-to-server endpoints (token, register) stay on the request host."
+).option(
+  "--obo",
+  "Enable On-Behalf-Of token exchange in HTTP mode. Exchanges the incoming bearer token for a Graph API token using the OBO flow. Requires MS365_MCP_CLIENT_SECRET."
+).addOption(
+  // DEPRECATED: kept only so existing deployments that set --base-url or
+  // MS365_MCP_BASE_URL do not crash at startup. Use --public-url /
+  // MS365_MCP_PUBLIC_URL instead. Hidden from --help; undocumented.
+  new Option("--base-url <url>", "deprecated: use --public-url").hideHelp()
+);
+function parseArgs() {
+  program.parse();
+  const options = program.opts();
+  if (options.listPresets) {
+    const presets = listPresets();
+    console.log(JSON.stringify({ presets }, null, 2));
+    process.exit(0);
+  }
+  if (options.preset) {
+    const presetNames = options.preset.split(",").map((p) => p.trim());
+    try {
+      options.enabledTools = getCombinedPresetPattern(presetNames);
+      const requiresOrgMode = presetNames.some((preset) => presetRequiresOrgMode(preset));
+      if (requiresOrgMode && !options.orgMode) {
+        console.warn(
+          `Warning: Preset(s) [${presetNames.filter((p) => presetRequiresOrgMode(p)).join(", ")}] require --org-mode to function properly`
+        );
+      }
+    } catch (error) {
+      console.error(`Error: ${error.message}`);
+      process.exit(1);
+    }
+  }
+  if (process.env.READ_ONLY === "true" || process.env.READ_ONLY === "1") {
+    options.readOnly = true;
+  }
+  if (process.env.ENABLED_TOOLS) {
+    options.enabledTools = process.env.ENABLED_TOOLS;
+  }
+  if (options.enabledTools) {
+    try {
+      new RegExp(options.enabledTools, "i");
+    } catch {
+      console.error(
+        `Error: invalid --enabled-tools regex pattern: "${options.enabledTools}". Without a valid filter, all tools would be exposed.`
+      );
+      process.exit(1);
+    }
+  }
+  if (process.env.MS365_MCP_ORG_MODE === "true" || process.env.MS365_MCP_ORG_MODE === "1") {
+    options.orgMode = true;
+  }
+  if (process.env.MS365_MCP_FORCE_WORK_SCOPES === "true" || process.env.MS365_MCP_FORCE_WORK_SCOPES === "1") {
+    options.forceWorkScopes = true;
+  }
+  if (options.workMode || options.forceWorkScopes) {
+    options.orgMode = true;
+  }
+  if (process.env.MS365_MCP_OUTPUT_FORMAT === "toon") {
+    options.toon = true;
+  }
+  if (options.http) {
+    if (options.dynamicRegistration === false) {
+      options.enableDynamicRegistration = false;
+    } else {
+      options.enableDynamicRegistration = true;
+    }
+  }
+  if (process.env.MS365_MCP_OBO === "true" || process.env.MS365_MCP_OBO === "1") {
+    options.obo = true;
+  }
+  if (options.cloud) {
+    process.env.MS365_MCP_CLOUD_TYPE = options.cloud;
+  }
+  return options;
+}
+export {
+  parseArgs
+};

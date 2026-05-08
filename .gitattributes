@@ -1,0 +1,8 @@
+# Force LF in the repo for vendored dist/ output, regardless of platform.
+# Without this, dist/ committed from Windows ends up with CRLF in the repo;
+# the verify-dist CI workflow on Ubuntu rebuilds with LF and the byte-level
+# diff (line endings only) makes the dist-sync check fail spuriously.
+dist/** text eol=lf
+
+# Treat lockfile as text-lf to keep deterministic across platforms.
+package-lock.json text eol=lf

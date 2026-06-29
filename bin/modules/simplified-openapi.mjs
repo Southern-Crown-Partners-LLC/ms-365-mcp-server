@@ -1,9 +1,18 @@
 import fs from 'fs';
 import yaml from 'js-yaml';
 
-export function createAndSaveSimplifiedOpenAPI(endpointsFile, openapiFile, openapiTrimmedFile) {
+export function createAndSaveSimplifiedOpenAPI(
+  endpointsFile,
+  openapiFile,
+  openapiTrimmedFile,
+  apiVersion = 'v1.0'
+) {
   const allEndpoints = JSON.parse(fs.readFileSync(endpointsFile, 'utf8'));
-  const endpoints = allEndpoints.filter((endpoint) => !endpoint.disabled);
+  // Each spec is trimmed against only the endpoints targeting its version. Entries
+  // without an explicit apiVersion default to v1.0, so existing endpoints are unchanged.
+  const endpoints = allEndpoints.filter(
+    (endpoint) => !endpoint.disabled && (endpoint.apiVersion ?? 'v1.0') === apiVersion
+  );
 
   const spec = fs.readFileSync(openapiFile, 'utf8');
   const openApiSpec = yaml.load(spec);
@@ -17,11 +26,27 @@ export function createAndSaveSimplifiedOpenAPI(endpointsFile, openapiFile, opena
     }
   }
 
-  // Synthesize operations on existing paths when the method is missing.
+  // Two cases handled here:
+  //  1. The method is missing entirely (Microsoft never published this operation):
+  //     synthesize the whole operation from endpoints.json.
+  //  2. The method exists but the endpoint declares its own requestBodySchema
+  //     (Microsoft published a deprecated/malformed/private-preview body our generator
+  //     can't consume): override ONLY the request body and keep Microsoft's published
+  //     responses/parameters intact, so we don't silently drop upstream fields or mask
+  //     a future upstream fix. requestBodySchema is explicit opt-in per endpoint.
   for (const endpoint of endpoints) {
     const pathSpec = openApiSpec.paths[endpoint.pathPattern];
     const methodLower = endpoint.method.toLowerCase();
-    if (pathSpec && !pathSpec[methodLower]) {
+    if (!pathSpec) continue;
+
+    const operationMissing = !pathSpec[methodLower];
+    const overrideBodyOnly =
+      !operationMissing &&
+      endpoint.requestBodySchema &&
+      methodLower !== 'get' &&
+      methodLower !== 'delete';
+
+    if (operationMissing) {
       const pathParamMatches = [...endpoint.pathPattern.matchAll(/\{([^}]+)\}/g)].map((m) => m[1]);
       const synthesizedParameters = pathParamMatches.map((paramName) => ({
         name: paramName,
@@ -44,7 +69,14 @@ export function createAndSaveSimplifiedOpenAPI(endpointsFile, openapiFile, opena
                 required: true,
                 content: {
                   'application/json': {
-                    schema: { type: 'object', additionalProperties: true },
+                    // When an endpoint declares a typed body schema in endpoints.json
+                    // (for APIs Microsoft hasn't published in its OpenAPI metadata),
+                    // use it so the generated client gets a validated `body` param.
+                    // Otherwise fall back to a permissive object.
+                    schema: endpoint.requestBodySchema ?? {
+                      type: 'object',
+                      additionalProperties: true,
+                    },
                   },
                 },
               },
@@ -61,6 +93,24 @@ export function createAndSaveSimplifiedOpenAPI(endpointsFile, openapiFile, opena
           '5XX': { $ref: '#/components/responses/error' },
         },
       };
+    } else if (overrideBodyOnly) {
+      // Surgical override: replace only the request body, leaving Microsoft's
+      // published responses and parameters for this operation untouched.
+      pathSpec[methodLower].requestBody = {
+        description: pathSpec[methodLower].requestBody?.description || 'Operation payload',
+        required: true,
+        content: {
+          'application/json': {
+            schema: endpoint.requestBodySchema,
+          },
+        },
+      };
+      // These operations are often published as deprecated/private-preview, which
+      // openapi-zod-client skips by default. Declaring a requestBodySchema means we
+      // deliberately vouch for the endpoint, so clear the deprecation markers to keep
+      // it in the generated client.
+      delete pathSpec[methodLower].deprecated;
+      delete pathSpec[methodLower]['x-ms-deprecation'];
     }
   }
 
@@ -95,6 +145,10 @@ export function createAndSaveSimplifiedOpenAPI(endpointsFile, openapiFile, opena
     }
   }
 
+  if (apiVersion === 'beta') {
+    normalizeWildcardSuccessResponses(openApiSpec.paths);
+  }
+
   if (openApiSpec.components && openApiSpec.components.schemas) {
     removeODataTypeRecursively(openApiSpec.components.schemas);
     flattenComplexSchemasRecursively(openApiSpec.components.schemas);
@@ -110,6 +164,29 @@ export function createAndSaveSimplifiedOpenAPI(endpointsFile, openapiFile, opena
   pruneUnusedSchemas(openApiSpec, usedSchemas);
 
   fs.writeFileSync(openapiTrimmedFile, yaml.dump(openApiSpec));
+}
+
+function normalizeWildcardSuccessResponses(paths) {
+  Object.values(paths || {}).forEach((pathItem) => {
+    if (!pathItem || typeof pathItem !== 'object') return;
+
+    Object.entries(pathItem).forEach(([method, operation]) => {
+      if (!operation || typeof operation !== 'object') return;
+      if (!operation.responses || !operation.responses['2XX']) return;
+
+      const hasConcreteSuccess = Object.keys(operation.responses).some((statusCode) =>
+        /^2\d\d$/.test(statusCode)
+      );
+      if (hasConcreteSuccess) {
+        delete operation.responses['2XX'];
+        return;
+      }
+
+      const successStatus = method === 'post' ? '201' : method === 'delete' ? '204' : '200';
+      operation.responses[successStatus] = operation.responses['2XX'];
+      delete operation.responses['2XX'];
+    });
+  });
 }
 
 function removeODataTypeRecursively(obj) {
@@ -508,6 +585,14 @@ function findUsedSchemas(openApiSpec) {
             );
             schemasToProcess.push(schemaName);
           }
+          // Trace refs nested anywhere in an inline request body (e.g. a property's
+          // anyOf: [{$ref}, {nullable object}]). Without this they're pruned as unused,
+          // then stripped as a "broken reference", degrading the body to a bare object.
+          if (content.schema) {
+            findRefsInObject(content.schema, (ref) =>
+              schemasToProcess.push(ref.replace('#/components/schemas/', ''))
+            );
+          }
         });
       }
 
@@ -546,6 +631,12 @@ function findUsedSchemas(openApiSpec) {
                     schemasToProcess.push(schemaName);
                   }
                 });
+              }
+              // Trace refs nested anywhere in an inline response schema.
+              if (content.schema) {
+                findRefsInObject(content.schema, (ref) =>
+                  schemasToProcess.push(ref.replace('#/components/schemas/', ''))
+                );
               }
             });
           }

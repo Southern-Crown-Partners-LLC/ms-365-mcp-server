@@ -22,4 +22,21 @@ describe('buildMcpServerInstructions', () => {
     const s = buildMcpServerInstructions({ ...baseCtx, discovery: false, readOnly: true });
     expect(s).toContain('read-only');
   });
+
+  it('does not suggest account switching when multiAccount is false', () => {
+    const s = buildMcpServerInstructions({ ...baseCtx, discovery: false, multiAccount: false });
+    expect(s).not.toContain('Multiple accounts');
+    expect(s).not.toContain('account parameter');
+  });
+
+  it('routes drive file downloads to get-download-url and authenticated byte reads to download-bytes', () => {
+    const s = buildMcpServerInstructions({ ...baseCtx, discovery: false });
+    expect(s).toContain('large drive/SharePoint file content');
+    expect(s).toContain('prefer get-download-url');
+    expect(s).toContain('download-bytes for authenticated byte reads');
+    expect(s).toContain(
+      'mail attachments, profile photos, Teams hosted content, and meeting recordings'
+    );
+    expect(s).toContain('relative Microsoft Graph paths, not absolute URLs');
+  });
 });

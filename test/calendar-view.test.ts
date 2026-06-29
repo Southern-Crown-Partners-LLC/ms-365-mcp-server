@@ -11,6 +11,7 @@ vi.mock('../src/logger.js', () => ({
   },
 }));
 
+vi.mock('../src/generated/client-beta.js', () => ({ api: { endpoints: [] } }));
 vi.mock('../src/generated/client.js', () => ({
   api: {
     endpoints: [
@@ -137,8 +138,14 @@ describe('Calendar View Tools', () => {
 
       for (const call of mockServer.tool.mock.calls) {
         const toolName = call[0] as string;
-        // Skip utility tools that are not Graph API endpoints
-        if (toolName === 'parse-teams-url' || toolName === 'download-bytes') continue;
+        // Skip utilities and read-only POST query tools that are not GET Graph endpoints.
+        if (
+          toolName === 'parse-teams-url' ||
+          toolName === 'download-bytes' ||
+          toolName === 'copilot-retrieve' ||
+          toolName === 'get-download-url'
+        )
+          continue;
         const paramSchema = call[2] as Record<string, z.ZodTypeAny>;
         expect(paramSchema).toHaveProperty('fetchAllPages');
       }

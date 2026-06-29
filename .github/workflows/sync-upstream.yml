@@ -86,9 +86,25 @@ jobs:
           Review the diff and merge if safe. Close this PR to skip — a fresh one opens next Monday.
           EOF
           )
-            gh pr create --base scp-main --head "$BRANCH" \
+            # Try to open the PR. This needs "Allow GitHub Actions to create and
+            # approve pull requests" enabled at BOTH the org and repo level; if the
+            # org override is off the API returns 403. Don't fail the run over it —
+            # the synced branch is already pushed and ready to review, so just emit
+            # a one-click PR link to the job summary instead.
+            if ! gh pr create --base scp-main --head "$BRANCH" \
               --title "Sync from softeria/main ($DATE)" \
-              --body "$BODY"
+              --body "$BODY"; then
+              echo "::warning::Could not auto-create the PR (Actions may lack PR-create permission). Open it manually:"
+              {
+                echo "### Upstream sync branch ready: \`$BRANCH\`"
+                echo ""
+                echo "Automated PR creation was blocked. **$BEHIND** new upstream commits are merged and pushed."
+                echo ""
+                echo "$CONFLICT_NOTE"
+                echo ""
+                echo "👉 [Open the pull request](https://github.com/${GITHUB_REPOSITORY}/compare/scp-main...${BRANCH}?expand=1)"
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
           else
             echo "PR #$EXISTING already open for $BRANCH"
           fi

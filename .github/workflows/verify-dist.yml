@@ -1,20 +1,33 @@
-name: Verify dist sync
+name: Vendor dist
+
+# The vendored dist/ is what `npx`-from-GitHub serves, so it must match a clean
+# build of src/. Building it on a contributor's machine is fragile: a Windows
+# build and this Ubuntu runner can disagree byte-for-byte (e.g. the generated
+# Graph client), which made the old "fail if out of sync" check spuriously red.
+# Instead, let CI own the build: rebuild on Linux and commit the canonical dist/
+# back to scp-main whenever it drifts. The commit is tagged [skip ci] so it does
+# not retrigger this (or any) workflow.
 
 on:
-  pull_request:
-    branches: [scp-main]
   push:
     branches: [scp-main]
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: vendor-dist
+  cancel-in-progress: false
 
 jobs:
-  verify:
+  vendor:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: scp-main
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -29,12 +42,17 @@ jobs:
           npm run generate
           npm run build
 
-      - name: Check dist/ is in sync with src/
+      - name: Commit rebuilt dist/ if it drifted
         run: |
-          if [ -n "$(git status --porcelain dist/)" ]; then
-            echo "::error::dist/ is out of sync with src/. Run 'npm ci && npm run generate && npm run build' locally and commit the result."
-            git status dist/
-            git diff --stat dist/
-            exit 1
+          if [ -z "$(git status --porcelain dist/)" ]; then
+            echo "dist/ is already in sync — nothing to commit."
+            exit 0
           fi
-          echo "dist/ is in sync"
+          echo "dist/ drifted from a clean Linux build — committing the canonical version:"
+          git status --short dist/
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dist/
+          git commit -m "chore: rebuild vendored dist/ on CI [skip ci]"
+          git pull --rebase origin scp-main
+          git push origin scp-main

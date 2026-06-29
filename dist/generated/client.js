@@ -365,6 +365,57 @@ const microsoft_graph_teamsTab = z.object({
   webUrl: z.string().describe("Deep link URL of the tab instance. Read-only.").nullish(),
   teamsApp: microsoft_graph_teamsApp.optional()
 }).passthrough();
+const microsoft_graph_targetedChatMessage = z.object({
+  id: z.string().describe("The unique identifier for an entity. Read-only.").optional(),
+  createdDateTime: z.string().regex(
+    /^[0-9]{4,}-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{1,12})?(Z|[+-][0-9][0-9]:[0-9][0-9])$/
+  ).datetime({ offset: true }).describe("Timestamp of when the chat message was created.").nullish(),
+  lastModifiedDateTime: z.string().regex(
+    /^[0-9]{4,}-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{1,12})?(Z|[+-][0-9][0-9]:[0-9][0-9])$/
+  ).datetime({ offset: true }).describe(
+    "Read only. Timestamp when the chat message is created (initial setting) or modified, including when a reaction is added or removed."
+  ).nullish(),
+  body: microsoft_graph_itemBody.optional(),
+  subject: z.string().describe("The subject of the chat message, in plaintext.").nullish(),
+  attachments: z.array(microsoft_graph_chatMessageAttachment).describe("References to attached objects like files, tabs, meetings etc.").optional(),
+  importance: microsoft_graph_chatMessageImportance.optional(),
+  from: microsoft_graph_chatMessageFromIdentitySet.optional(),
+  channelIdentity: microsoft_graph_channelIdentity.optional(),
+  chatId: z.string().describe("If the message was sent in a chat, represents the identity of the chat.").nullish(),
+  deletedDateTime: z.string().regex(
+    /^[0-9]{4,}-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{1,12})?(Z|[+-][0-9][0-9]:[0-9][0-9])$/
+  ).datetime({ offset: true }).describe(
+    "Read only. Timestamp at which the chat message was deleted, or null if not deleted."
+  ).nullish(),
+  etag: z.string().describe("Read-only. Version number of the chat message.").nullish(),
+  eventDetail: microsoft_graph_eventMessageDetail.optional(),
+  lastEditedDateTime: z.string().regex(
+    /^[0-9]{4,}-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{1,12})?(Z|[+-][0-9][0-9]:[0-9][0-9])$/
+  ).datetime({ offset: true }).describe(
+    "Read only. Timestamp when edits to the chat message were made. Triggers an 'Edited' flag in the Teams UI. If no edits are made the value is null."
+  ).nullish(),
+  locale: z.string().describe("Locale of the chat message set by the client. Always set to en-us.").optional(),
+  mentions: z.array(microsoft_graph_chatMessageMention).describe(
+    "List of entities mentioned in the chat message. Supported entities are: user, bot, team, channel, chat, and tag."
+  ).optional(),
+  messageHistory: z.array(microsoft_graph_chatMessageHistoryItem).describe(
+    "List of activity history of a message item, including modification time and actions, such as reactionAdded, reactionRemoved, or reaction changes, on the message."
+  ).optional(),
+  messageType: microsoft_graph_chatMessageType.optional(),
+  policyViolation: microsoft_graph_chatMessagePolicyViolation.optional(),
+  reactions: z.array(microsoft_graph_chatMessageReaction).describe("Reactions for this chat message (for example, Like).").optional(),
+  replyToId: z.string().describe(
+    "Read-only. ID of the parent chat message or root chat message of the thread. (Only applies to chat messages in channels, not chats.)"
+  ).nullish(),
+  summary: z.string().describe(
+    "Summary text of the chat message that could be used for push notifications and summary views or fall back views. Only applies to channel chat messages, not chat messages in a chat."
+  ).nullish(),
+  webUrl: z.string().describe("Read-only. Link to the message in Microsoft Teams.").nullish(),
+  hostedContents: z.array(microsoft_graph_chatMessageHostedContent).describe(
+    "Content in a message hosted by Microsoft Teams - for example, images or code snippets."
+  ).optional(),
+  replies: z.array(microsoft_graph_chatMessage).describe("Replies for a specified message. Supports $expand for channel messages.").optional()
+}).passthrough().passthrough();
 const microsoft_graph_chat = z.object({
   id: z.string().describe("The unique identifier for an entity. Read-only.").optional(),
   chatType: microsoft_graph_chatType.optional(),
@@ -381,7 +432,9 @@ const microsoft_graph_chat = z.object({
   onlineMeetingInfo: microsoft_graph_teamworkOnlineMeetingInfo.optional(),
   originalCreatedDateTime: z.string().regex(
     /^[0-9]{4,}-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{1,12})?(Z|[+-][0-9][0-9]:[0-9][0-9])$/
-  ).datetime({ offset: true }).nullish(),
+  ).datetime({ offset: true }).describe(
+    "Timestamp of the original creation time for the chat. The value is null if the chat never entered migration mode."
+  ).nullish(),
   tenantId: z.string().describe("The identifier of the tenant in which the chat was created. Read-only.").nullish(),
   topic: z.string().describe("(Optional) Subject or topic for the chat. Only available for group chats.").nullish(),
   viewpoint: microsoft_graph_chatViewpoint.optional(),
@@ -394,7 +447,8 @@ const microsoft_graph_chat = z.object({
   messages: z.array(microsoft_graph_chatMessage).describe("A collection of all the messages in the chat. Nullable.").optional(),
   permissionGrants: z.array(microsoft_graph_resourceSpecificPermissionGrant).describe("A collection of permissions granted to apps for the chat.").optional(),
   pinnedMessages: z.array(microsoft_graph_pinnedChatMessageInfo).describe("A collection of all the pinned messages in the chat. Nullable.").optional(),
-  tabs: z.array(microsoft_graph_teamsTab).describe("A collection of all the tabs in the chat. Nullable.").optional()
+  tabs: z.array(microsoft_graph_teamsTab).describe("A collection of all the tabs in the chat. Nullable.").optional(),
+  targetedMessages: z.array(microsoft_graph_targetedChatMessage).optional()
 }).passthrough();
 const microsoft_graph_ODataErrors_ErrorDetails = z.object({ code: z.string(), message: z.string(), target: z.string().nullish() }).passthrough();
 const microsoft_graph_ODataErrors_InnerError = z.object({
@@ -1579,6 +1633,7 @@ const microsoft_graph_group = z.object({
   hideFromOutlookClients: z.boolean().describe(
     "True if the group isn't displayed in Outlook clients, such as Outlook for Windows and Outlook on the web; otherwise, false. The default value is false. Requires $select to retrieve. Supported only on the Get group API (GET /groups/{ID})."
   ).nullish(),
+  infoCatalogs: z.array(z.string()).optional(),
   isArchived: z.boolean().describe(
     "When a group is associated with a team, this property determines whether the team is in read-only mode.To read this property, use the /group/{groupId}/team endpoint or the Get team API. To update this property, use the archiveTeam and unarchiveTeam APIs."
   ).nullish(),
@@ -1603,9 +1658,6 @@ const microsoft_graph_group = z.object({
   ).nullish(),
   membershipRule: z.string().describe(
     "The rule that determines members for this group if the group is a dynamic group (groupTypes contains DynamicMembership). For more information about the syntax of the membership rule, see Membership Rules syntax. Returned by default. Supports $filter (eq, ne, not, ge, le, startsWith)."
-  ).nullish(),
-  membershipRuleProcessingState: z.string().describe(
-    "Indicates whether the dynamic membership processing is on or paused. Possible values are On or Paused. Returned by default. Supports $filter (eq, ne, not, in)."
   ).nullish()
 }).passthrough().passthrough();
 const microsoft_graph_groupCollectionResponse = z.object({
@@ -2858,7 +2910,9 @@ const microsoft_graph_channel = z.lazy(
     migrationMode: microsoft_graph_migrationMode.optional(),
     originalCreatedDateTime: z.string().regex(
       /^[0-9]{4,}-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{1,12})?(Z|[+-][0-9][0-9]:[0-9][0-9])$/
-    ).datetime({ offset: true }).nullish(),
+    ).datetime({ offset: true }).describe(
+      "Timestamp of the original creation time for the channel. The value is null if the channel never entered migration mode."
+    ).nullish(),
     summary: microsoft_graph_channelSummary.optional(),
     tenantId: z.string().describe("The ID of the Microsoft Entra tenant.").nullish(),
     webUrl: z.string().describe(
@@ -2953,7 +3007,7 @@ const microsoft_graph_team = z.lazy(
     ).nullish(),
     allChannels: z.array(microsoft_graph_channel).describe("List of channels either hosted in or shared with the team (incoming channels).").optional(),
     channels: z.array(microsoft_graph_channel).describe("The collection of channels and messages associated with the team.").optional(),
-    group: microsoft_graph_group.describe("[Note: Simplified from 74 properties to 25 most common ones]").optional(),
+    group: microsoft_graph_group.describe("[Note: Simplified from 75 properties to 25 most common ones]").optional(),
     incomingChannels: z.array(microsoft_graph_channel).describe("List of channels shared with the team.").optional(),
     installedApps: z.array(microsoft_graph_teamsAppInstallation).describe("The apps installed in this team.").optional(),
     members: z.array(microsoft_graph_conversationMember).describe("Members and owners of the team.").optional(),
@@ -4791,6 +4845,7 @@ const schemas = {
   microsoft_graph_pinnedChatMessageInfo,
   microsoft_graph_teamsTabConfiguration,
   microsoft_graph_teamsTab,
+  microsoft_graph_targetedChatMessage,
   microsoft_graph_chat,
   microsoft_graph_ODataErrors_ErrorDetails,
   microsoft_graph_ODataErrors_InnerError,
@@ -6837,6 +6892,7 @@ You can search within a folder hierarchy, a whole drive, or files shared with th
           hideFromOutlookClients: z.boolean().describe(
             "True if the group isn't displayed in Outlook clients, such as Outlook for Windows and Outlook on the web; otherwise, false. The default value is false. Requires $select to retrieve. Supported only on the Get group API (GET /groups/{ID})."
           ).nullish(),
+          infoCatalogs: z.array(z.string()).optional(),
           isArchived: z.boolean().describe(
             "When a group is associated with a team, this property determines whether the team is in read-only mode.To read this property, use the /group/{groupId}/team endpoint or the Get team API. To update this property, use the archiveTeam and unarchiveTeam APIs."
           ).nullish(),
@@ -6861,9 +6917,6 @@ You can search within a folder hierarchy, a whole drive, or files shared with th
           ).nullish(),
           membershipRule: z.string().describe(
             "The rule that determines members for this group if the group is a dynamic group (groupTypes contains DynamicMembership). For more information about the syntax of the membership rule, see Membership Rules syntax. Returned by default. Supports $filter (eq, ne, not, ge, le, startsWith)."
-          ).nullish(),
-          membershipRuleProcessingState: z.string().describe(
-            "Indicates whether the dynamic membership processing is on or paused. Possible values are On or Paused. Returned by default. Supports $filter (eq, ne, not, in)."
           ).nullish()
         }).passthrough().passthrough()
       }
@@ -6952,6 +7005,7 @@ You can create or update the following types of group: By default, this operatio
           hideFromOutlookClients: z.boolean().describe(
             "True if the group isn't displayed in Outlook clients, such as Outlook for Windows and Outlook on the web; otherwise, false. The default value is false. Requires $select to retrieve. Supported only on the Get group API (GET /groups/{ID})."
           ).nullish(),
+          infoCatalogs: z.array(z.string()).optional(),
           isArchived: z.boolean().describe(
             "When a group is associated with a team, this property determines whether the team is in read-only mode.To read this property, use the /group/{groupId}/team endpoint or the Get team API. To update this property, use the archiveTeam and unarchiveTeam APIs."
           ).nullish(),
@@ -6976,9 +7030,6 @@ You can create or update the following types of group: By default, this operatio
           ).nullish(),
           membershipRule: z.string().describe(
             "The rule that determines members for this group if the group is a dynamic group (groupTypes contains DynamicMembership). For more information about the syntax of the membership rule, see Membership Rules syntax. Returned by default. Supports $filter (eq, ne, not, ge, le, startsWith)."
-          ).nullish(),
-          membershipRuleProcessingState: z.string().describe(
-            "Indicates whether the dynamic membership processing is on or paused. Possible values are On or Paused. Returned by default. Supports $filter (eq, ne, not, in)."
           ).nullish()
         }).passthrough().passthrough()
       }

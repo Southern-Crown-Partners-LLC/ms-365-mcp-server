@@ -48,10 +48,28 @@ jobs:
           git checkout -B "$BRANCH"
 
           CONFLICT_NOTE=""
-          if ! git merge --no-edit --no-ff upstream/main; then
+          git merge --no-edit --no-ff upstream/main || true
+
+          # Always keep our own fork's CI — never take upstream's .github/workflows/.
+          # This resolves the recurring release.yml modify/delete conflict and avoids
+          # the "GitHub App can't push workflow changes without `workflows` permission"
+          # rejection (the default GITHUB_TOKEN can't update workflow files).
+          rm -rf .github/workflows
+          git checkout scp-main -- .github/workflows
+          git add -A
+
+          # Flag only real conflicts that remain in non-workflow files.
+          if git ls-files --unmerged | grep -q .; then
             CONFLICT_NOTE="**Merge had conflicts** — this branch has unresolved conflict markers. Resolve manually before merging."
-            git add -A
-            git commit -m "Sync upstream ($DATE) — conflicts present, requires manual resolution"
+          fi
+
+          if [ -f .git/MERGE_HEAD ]; then
+            # Merge stopped on conflict and is still uncommitted — commit it now.
+            git commit --no-edit -m "Sync upstream ($DATE)"
+          else
+            # Clean merge already committed — fold the workflow restoration into it
+            # so no separate commit touches .github/workflows/.
+            git commit --amend --no-edit || true
           fi
 
           git push -f origin "$BRANCH"

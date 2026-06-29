@@ -3,21 +3,31 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import express from "express";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 import logger, { enableConsoleLogging } from "./logger.js";
 import { registerAuthTools } from "./auth-tools.js";
 import { registerGraphTools, registerDiscoveryTools } from "./graph-tools.js";
 import { buildMcpServerInstructions } from "./mcp-instructions.js";
 import GraphClient from "./graph-client.js";
-import { buildScopesFromEndpoints } from "./auth.js";
+import {
+  buildScopesFromEndpoints,
+  parseAllowedScopes,
+  resolveAuthScopes
+} from "./auth.js";
 import { MicrosoftOAuthProvider } from "./oauth-provider.js";
 import {
   exchangeCodeForToken,
   microsoftBearerTokenAuthMiddleware,
-  refreshAccessToken
+  OAuthUpstreamError,
+  refreshAccessToken,
+  toOAuthErrorResponse
 } from "./lib/microsoft-auth.js";
+import { isAllowedRedirectUri, parseAllowlist } from "./lib/redirect-uri-validation.js";
 import { getSecrets } from "./secrets.js";
 import { getCloudEndpoints } from "./cloud-config.js";
 import { requestContext } from "./request-context.js";
+import { dumpError } from "./crash-logging.js";
 import crypto from "node:crypto";
 import OboClient from "./obo-client.js";
 function parseHttpOption(httpOption) {
@@ -76,7 +86,8 @@ class MicrosoftGraphServer {
         this.authManager,
         this.multiAccount,
         this.accountNames,
-        this.options.enabledTools
+        this.options.enabledTools,
+        this.options.allowedScopes
       );
     } else {
       registerGraphTools(
@@ -87,7 +98,8 @@ class MicrosoftGraphServer {
         this.options.orgMode,
         this.authManager,
         this.multiAccount,
-        this.accountNames
+        this.accountNames,
+        this.options.allowedScopes
       );
     }
     return server;
@@ -95,17 +107,24 @@ class MicrosoftGraphServer {
   async initialize(version) {
     this.secrets = await getSecrets();
     this.version = version;
-    try {
-      this.multiAccount = await this.authManager.isMultiAccount();
-      if (this.multiAccount) {
-        const accounts = await this.authManager.listAccounts();
-        this.accountNames = accounts.map((a) => a.username).filter((u) => !!u);
-        logger.info(
-          `Multi-account mode detected (${this.accountNames.length} accounts): "account" parameter will be injected into all tool schemas`
-        );
+    const accountRoutingAvailable = (!this.options.http || this.options.trustProxyAuth) && !this.authManager.isOAuthModeEnabled();
+    if (accountRoutingAvailable) {
+      try {
+        this.multiAccount = await this.authManager.isMultiAccount();
+        if (this.multiAccount) {
+          const accounts = await this.authManager.listAccounts();
+          this.accountNames = accounts.map((a) => a.username).filter((u) => !!u);
+          logger.info(
+            `Multi-account mode detected (${this.accountNames.length} accounts): "account" parameter will be injected into all tool schemas`
+          );
+        }
+      } catch (err) {
+        logger.warn(`Failed to detect multi-account mode: ${err.message}`);
       }
-    } catch (err) {
-      logger.warn(`Failed to detect multi-account mode: ${err.message}`);
+    } else {
+      logger.info(
+        'Account routing disabled: requests use the OAuth bearer identity, so the "account" parameter is not injected into tool schemas'
+      );
     }
     if (this.options.obo) {
       if (!this.options.http) {
@@ -114,6 +133,11 @@ class MicrosoftGraphServer {
       if (!this.secrets.clientSecret) {
         throw new Error(
           "--obo requires MS365_MCP_CLIENT_SECRET to be set (confidential client required for On-Behalf-Of flow)."
+        );
+      }
+      if (this.options.trustProxyAuth) {
+        throw new Error(
+          "--obo cannot be combined with --trust-proxy-auth: the proxy-auth pass-through skips the incoming bearer token that OBO would exchange."
         );
       }
       this.oboClient = new OboClient(this.secrets);
@@ -145,7 +169,20 @@ class MicrosoftGraphServer {
     if (this.options.http) {
       const { host, port } = parseHttpOption(this.options.http);
       const app = express();
-      app.set("trust proxy", true);
+      const trustProxyEnv = process.env.MS365_MCP_TRUST_PROXY_HOPS;
+      if (trustProxyEnv !== void 0 && trustProxyEnv !== "") {
+        const asNum = Number(trustProxyEnv);
+        app.set("trust proxy", Number.isFinite(asNum) ? asNum : trustProxyEnv);
+      } else {
+        app.set("trust proxy", 1);
+      }
+      app.use(
+        helmet({
+          contentSecurityPolicy: false,
+          crossOriginEmbedderPolicy: false,
+          hsts: { maxAge: 31536e3, includeSubDomains: true, preload: true }
+        })
+      );
       app.use(express.json());
       app.use(express.urlencoded({ extended: true }));
       const corsOrigin = process.env.MS365_MCP_CORS_ORIGIN || "http://localhost:3000";
@@ -162,6 +199,25 @@ class MicrosoftGraphServer {
         }
         next();
       });
+      const rateLimitDisabled = process.env.MS365_MCP_RATE_LIMIT_DISABLED === "true" || process.env.MS365_MCP_RATE_LIMIT_DISABLED === "1";
+      if (!rateLimitDisabled) {
+        const authLimiter = rateLimit({
+          windowMs: 6e4,
+          max: 30,
+          standardHeaders: "draft-7",
+          legacyHeaders: false
+        });
+        const mcpLimiter = rateLimit({
+          windowMs: 6e4,
+          max: 120,
+          standardHeaders: "draft-7",
+          legacyHeaders: false
+        });
+        app.use("/authorize", authLimiter);
+        app.use("/token", authLimiter);
+        app.use("/register", authLimiter);
+        app.use("/mcp", mcpLimiter);
+      }
       const oauthProvider = new MicrosoftOAuthProvider(this.authManager, this.secrets);
       const publicUrlRaw = this.options.publicUrl || process.env.MS365_MCP_PUBLIC_URL || this.options.baseUrl || process.env.MS365_MCP_BASE_URL || null;
       const publicBase = publicUrlRaw ? new URL(publicUrlRaw).href.replace(/\/$/, "") : null;
@@ -169,11 +225,11 @@ class MicrosoftGraphServer {
         const protocol = req.secure ? "https" : "http";
         const requestOrigin = `${protocol}://${req.get("host")}`;
         const browserBase = publicBase ?? requestOrigin;
-        const scopes = buildScopesFromEndpoints(this.options.orgMode, this.options.enabledTools);
+        const scopes = this.options.obo ? [`${this.secrets.clientId}/access_as_user`] : resolveAuthScopes(this.options);
         const metadata = {
           issuer: browserBase,
           authorization_endpoint: `${browserBase}/authorize`,
-          token_endpoint: `${requestOrigin}/token`,
+          token_endpoint: `${browserBase}/token`,
           response_types_supported: ["code"],
           response_modes_supported: ["query"],
           grant_types_supported: ["authorization_code", "refresh_token"],
@@ -182,23 +238,25 @@ class MicrosoftGraphServer {
           scopes_supported: scopes
         };
         if (this.options.enableDynamicRegistration) {
-          metadata.registration_endpoint = `${requestOrigin}/register`;
+          metadata.registration_endpoint = `${browserBase}/register`;
         }
         res.json(metadata);
       });
-      app.get("/.well-known/oauth-protected-resource", async (req, res) => {
+      const protectedResourcesHandler = async (req, res) => {
         const protocol = req.secure ? "https" : "http";
         const requestOrigin = `${protocol}://${req.get("host")}`;
         const browserBase = publicBase ?? requestOrigin;
-        const scopes = this.options.obo ? [`api://${this.secrets.clientId}/access_as_user`] : buildScopesFromEndpoints(this.options.orgMode, this.options.enabledTools);
+        const scopes = this.options.obo ? [`${this.secrets.clientId}/access_as_user`] : resolveAuthScopes(this.options);
         res.json({
-          resource: `${requestOrigin}/mcp`,
+          resource: `${browserBase}/mcp`,
           authorization_servers: [browserBase],
           scopes_supported: scopes,
           bearer_methods_supported: ["header"],
           resource_documentation: browserBase
         });
-      });
+      };
+      app.get("/.well-known/oauth-protected-resource", protectedResourcesHandler);
+      app.get("/.well-known/oauth-protected-resource/*path", protectedResourcesHandler);
       if (this.options.enableDynamicRegistration) {
         app.post("/register", async (req, res) => {
           const body = req.body;
@@ -226,6 +284,20 @@ class MicrosoftGraphServer {
         const clientCodeChallenge = url.searchParams.get("code_challenge");
         const clientCodeChallengeMethod = url.searchParams.get("code_challenge_method");
         const state = url.searchParams.get("state");
+        const redirectUriParam = url.searchParams.get("redirect_uri");
+        if (redirectUriParam) {
+          const allowlist = parseAllowlist(process.env.MS365_MCP_ALLOWED_REDIRECT_URIS);
+          if (!isAllowedRedirectUri(redirectUriParam, allowlist)) {
+            logger.warn("Rejected /authorize request with disallowed redirect_uri", {
+              redirect_uri: redirectUriParam
+            });
+            res.status(400).json({
+              error: "invalid_request",
+              error_description: "redirect_uri is not allowed"
+            });
+            return;
+          }
+        }
         const allowedParams = [
           "response_type",
           "redirect_uri",
@@ -281,19 +353,15 @@ class MicrosoftGraphServer {
           }
         }
         microsoftAuthUrl.searchParams.set("client_id", clientId);
-        if (!microsoftAuthUrl.searchParams.get("scope")) {
-          microsoftAuthUrl.searchParams.set(
-            "scope",
-            "User.Read Files.Read Mail.Read offline_access"
-          );
-        } else {
-          const scopeValue = microsoftAuthUrl.searchParams.get("scope");
-          const scopeList = scopeValue.split(/\s+/).filter(Boolean);
-          if (!scopeList.includes("offline_access")) {
-            scopeList.push("offline_access");
-            microsoftAuthUrl.searchParams.set("scope", scopeList.join(" "));
-          }
-        }
+        const explicitAllowedScopes = parseAllowedScopes(this.options.allowedScopes);
+        const clientScope = microsoftAuthUrl.searchParams.get("scope");
+        const baseScopes = explicitAllowedScopes !== void 0 ? resolveAuthScopes(this.options) : clientScope ? clientScope.split(/\s+/).filter(Boolean) : buildScopesFromEndpoints(
+          this.options.orgMode,
+          this.options.enabledTools,
+          this.options.readOnly
+        );
+        const scopeSet = /* @__PURE__ */ new Set([...baseScopes, "User.Read", "offline_access"]);
+        microsoftAuthUrl.searchParams.set("scope", Array.from(scopeSet).join(" "));
         res.redirect(microsoftAuthUrl.toString());
       });
       app.post("/token", async (req, res) => {
@@ -382,11 +450,18 @@ class MicrosoftGraphServer {
             });
           }
         } catch (error) {
-          logger.error("Token endpoint error:", error);
-          res.status(500).json({
-            error: "server_error",
-            error_description: "Internal server error during token exchange"
-          });
+          if (error instanceof OAuthUpstreamError) {
+            logger.warn("Token endpoint: upstream OAuth error surfaced to client", {
+              upstream_status: error.status,
+              error: error.body.error,
+              suberror: error.body.suberror,
+              error_codes: error.body.error_codes
+            });
+          } else {
+            logger.error("Token endpoint error:", error);
+          }
+          const { status, body } = toOAuthErrorResponse(error);
+          res.status(status).json(body);
         }
       });
       app.use(
@@ -395,9 +470,14 @@ class MicrosoftGraphServer {
           issuerUrl: new URL(publicBase ?? `http://localhost:${port}`)
         })
       );
+      const mcpAuth = microsoftBearerTokenAuthMiddleware({
+        trustProxyAuth: this.options.trustProxyAuth,
+        allowUnauthenticatedDiscovery: this.options.allowUnauthenticatedDiscovery,
+        publicUrl: publicBase
+      });
       app.get(
         "/mcp",
-        microsoftBearerTokenAuthMiddleware,
+        mcpAuth,
         async (req, res) => {
           const handler = async () => {
             const server = this.createMcpServer();
@@ -439,7 +519,7 @@ class MicrosoftGraphServer {
       );
       app.post(
         "/mcp",
-        microsoftBearerTokenAuthMiddleware,
+        mcpAuth,
         async (req, res) => {
           const handler = async () => {
             const server = this.createMcpServer();
@@ -503,6 +583,9 @@ class MicrosoftGraphServer {
       }
     } else {
       const transport = new StdioServerTransport();
+      transport.onerror = (error) => {
+        logger.error("Stdio transport error", { error: dumpError(error) });
+      };
       await this.server.connect(transport);
       logger.info("Server connected to stdio transport");
     }

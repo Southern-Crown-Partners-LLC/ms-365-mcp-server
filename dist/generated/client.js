@@ -432,6 +432,8 @@ const microsoft_graph_pinnedChatMessageInfoCollectionResponse = z.object({
   "@odata.nextLink": z.string().nullable(),
   value: z.array(microsoft_graph_pinnedChatMessageInfo)
 }).partial().passthrough();
+const get_presences_by_user_id_Body = z.object({ ids: z.array(z.string()) }).partial().passthrough();
+const BaseCollectionPaginationCountResponse = z.object({ "@odata.count": z.number().int().nullable(), "@odata.nextLink": z.string().nullable() }).partial().passthrough();
 const microsoft_graph_outOfOfficeSettings = z.object({
   isOutOfOffice: z.boolean().describe(
     "If true, either of the following is met:The current time falls within the out-of-office window configured in Outlook or Teams.An event marked as 'Show as Out of Office' appears on the user's calendar.Otherwise, false."
@@ -491,6 +493,52 @@ const microsoft_graph_presence = z.object({
   statusMessage: microsoft_graph_presenceStatusMessage.optional(),
   workLocation: microsoft_graph_userWorkLocation.optional()
 }).passthrough();
+const copilot_retrieve_Body = z.object({
+  queryString: z.string().min(1).max(1500).regex(/\S/).describe(
+    "Natural-language query (a single sentence works best; max 1500 characters; must contain a non-whitespace character). Avoid spelling errors in context-rich keywords."
+  ),
+  dataSource: z.enum(["sharePoint", "oneDriveBusiness", "externalItem"]).describe(
+    "Which source to retrieve from \u2014 one at a time (interleaved results are not supported). 'sharePoint', 'oneDriveBusiness', or 'externalItem' (Copilot connectors)."
+  ),
+  filterExpression: z.string().describe(
+    "Optional KQL expression to scope the retrieval before the query runs. Supported SharePoint/OneDrive properties: Author, FileExtension, Filename, FileType, InformationProtectionLabelId, LastModifiedTime, ModifiedBy, Path, SiteID, Title. Invalid KQL is ignored (query runs unscoped)."
+  ).optional(),
+  resourceMetadata: z.array(z.string()).describe(
+    "Optional list of retrievable metadata fields to return per hit (e.g. ['title', 'author']). By default no metadata is returned."
+  ).optional(),
+  maximumNumberOfResults: z.number().int().gte(1).lte(25).describe(
+    "Optional cap on the number of results (1-25). Best practice: leave unset unless your LLM has strict token limits \u2014 results are unordered."
+  ).optional()
+}).passthrough();
+const microsoft_graph_retrievalExtract = z.object({
+  relevanceScore: z.number().describe("[Simplified from 3 options]").nullish(),
+  text: z.string().nullish()
+}).passthrough();
+const microsoft_graph_searchResourceMetadataDictionary = z.object({}).passthrough();
+const microsoft_graph_retrievalEntityType = z.enum([
+  "site",
+  "list",
+  "listItem",
+  "drive",
+  "driveItem",
+  "externalItem",
+  "unknownFutureValue"
+]);
+const microsoft_graph_sensitivityLabelInfo = z.object({
+  color: z.string().nullish(),
+  displayName: z.string().nullish(),
+  priority: z.number().gte(-2147483648).lte(2147483647).nullish(),
+  sensitivityLabelId: z.string().nullish(),
+  tooltip: z.string().nullish()
+}).passthrough();
+const microsoft_graph_retrievalHit = z.object({
+  extracts: z.array(microsoft_graph_retrievalExtract).optional(),
+  resourceMetadata: microsoft_graph_searchResourceMetadataDictionary.optional(),
+  resourceType: microsoft_graph_retrievalEntityType.optional(),
+  sensitivityLabel: microsoft_graph_sensitivityLabelInfo.optional(),
+  webUrl: z.string().nullish()
+}).passthrough();
+const microsoft_graph_retrievalResponse = z.object({ retrievalHits: z.array(microsoft_graph_retrievalHit).optional() }).passthrough();
 const microsoft_graph_geoCoordinates = z.object({
   altitude: z.number().describe(
     "Optional. The altitude (height), in feet,  above sea level for the item. Read-only. [Simplified from 3 options]"
@@ -769,6 +817,15 @@ const copy_drive_item_Body = z.object({
   childrenOnly: z.boolean().nullable().default(false),
   includeAllVersionHistory: z.boolean().nullable().default(false)
 }).partial().passthrough();
+const microsoft_graph_driveRecipient = z.object({
+  alias: z.string().describe(
+    "The alias of the domain object, for cases where an email address is unavailable (for example, security groups)."
+  ).nullish(),
+  email: z.string().describe(
+    "The email address for the recipient, if the recipient has an associated email address."
+  ).nullish(),
+  objectId: z.string().describe("The unique identifier for the recipient in the directory.").nullish()
+}).passthrough();
 const create_drive_item_share_link_Body = z.object({
   type: z.string().nullable(),
   scope: z.string().nullable(),
@@ -777,7 +834,7 @@ const create_drive_item_share_link_Body = z.object({
   ).datetime({ offset: true }).nullable(),
   password: z.string().nullable(),
   message: z.string().nullable(),
-  recipients: z.array(z.object({}).partial().passthrough()),
+  recipients: z.array(microsoft_graph_driveRecipient),
   retainInheritedPermissions: z.boolean().nullable().default(false),
   sendNotification: z.boolean().nullable().default(false)
 }).partial().passthrough();
@@ -861,7 +918,51 @@ const microsoft_graph_permission = z.object({
     "A unique token that can be used to access this shared item via the shares API. Read-only."
   ).nullish()
 }).passthrough();
-const create_upload_session_Body = z.object({ item: z.object({}).partial().passthrough() }).partial().passthrough();
+const microsoft_graph_driveItemSourceApplication = z.enum([
+  "teams",
+  "yammer",
+  "sharePoint",
+  "oneDrive",
+  "stream",
+  "powerPoint",
+  "office",
+  "loki",
+  "loop",
+  "other",
+  "unknownFutureValue"
+]);
+const microsoft_graph_driveItemSource = z.object({
+  application: microsoft_graph_driveItemSourceApplication.optional(),
+  externalId: z.string().describe("The external identifier for the drive item from the source.").nullish()
+}).passthrough();
+const microsoft_graph_mediaSourceContentCategory = z.enum([
+  "meeting",
+  "liveStream",
+  "presentation",
+  "screenRecording",
+  "story",
+  "profile",
+  "chat",
+  "note",
+  "comment",
+  "unknownFutureValue"
+]);
+const microsoft_graph_mediaSource = z.object({ contentCategory: microsoft_graph_mediaSourceContentCategory.optional() }).passthrough();
+const microsoft_graph_driveItemUploadableProperties = z.object({
+  description: z.string().describe(
+    "Provides a user-visible description of the item. Read-write. Only on OneDrive Personal."
+  ).nullish(),
+  driveItemSource: microsoft_graph_driveItemSource.optional(),
+  fileSize: z.number().describe(
+    "Provides an expected file size to perform a quota check before uploading. Only on OneDrive Personal."
+  ).nullish(),
+  fileSystemInfo: microsoft_graph_fileSystemInfo.optional(),
+  mediaSource: microsoft_graph_mediaSource.optional(),
+  name: z.string().describe("The name of the item (filename and extension). Read-write.").nullish()
+}).passthrough();
+const create_upload_session_Body = z.object({
+  item: z.union([microsoft_graph_driveItemUploadableProperties, z.object({}).partial().passthrough()])
+}).partial().passthrough();
 const microsoft_graph_uploadSession = z.object({
   expirationDateTime: z.string().regex(
     /^[0-9]{4,}-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{1,12})?(Z|[+-][0-9][0-9]:[0-9][0-9])$/
@@ -895,12 +996,11 @@ const share_drive_item_Body = z.object({
   roles: z.array(z.string().nullable()),
   sendInvitation: z.boolean().nullable().default(false),
   message: z.string().nullable(),
-  recipients: z.array(z.object({}).partial().passthrough()),
+  recipients: z.array(microsoft_graph_driveRecipient),
   retainInheritedPermissions: z.boolean().nullable().default(false),
   expirationDateTime: z.string().nullable(),
   password: z.string().nullable()
 }).partial().passthrough();
-const BaseCollectionPaginationCountResponse = z.object({ "@odata.count": z.number().int().nullable(), "@odata.nextLink": z.string().nullable() }).partial().passthrough();
 const ReferenceNumeric = z.enum(["-INF", "INF", "NaN"]);
 const create_drive_item_preview_Body = z.object({
   page: z.string().nullable(),
@@ -1850,6 +1950,35 @@ const microsoft_graph_conversationThreadCollectionResponse = z.object({
   value: z.array(microsoft_graph_conversationThread)
 }).partial().passthrough();
 const reply_to_group_thread_Body = z.object({ Post: microsoft_graph_post }).partial().passthrough();
+const microsoft_graph_calendarRoleType = z.enum([
+  "none",
+  "freeBusyRead",
+  "limitedRead",
+  "read",
+  "write",
+  "delegateWithoutPrivateEventAccess",
+  "delegateWithPrivateEventAccess",
+  "custom"
+]);
+const microsoft_graph_calendarPermission = z.object({
+  id: z.string().describe("The unique identifier for an entity. Read-only.").optional(),
+  allowedRoles: z.array(z.union([microsoft_graph_calendarRoleType, z.object({}).partial().passthrough()])).describe(
+    "List of allowed sharing or delegating permission levels for the calendar. The possible values are: none, freeBusyRead, limitedRead, read, write, delegateWithoutPrivateEventAccess, delegateWithPrivateEventAccess, custom."
+  ).optional(),
+  emailAddress: microsoft_graph_emailAddress.optional(),
+  isInsideOrganization: z.boolean().describe(
+    "True if the user in context (recipient or delegate) is inside the same organization as the calendar owner."
+  ).nullish(),
+  isRemovable: z.boolean().describe(
+    "True if the user can be removed from the list of recipients or delegates for the specified calendar, false otherwise. The 'My organization' user determines the permissions other people within your organization have to the given calendar. You can't remove 'My organization' as a share recipient to a calendar."
+  ).nullish(),
+  role: microsoft_graph_calendarRoleType.optional()
+}).passthrough();
+const microsoft_graph_calendarPermissionCollectionResponse = z.object({
+  "@odata.count": z.number().int().nullable(),
+  "@odata.nextLink": z.string().nullable(),
+  value: z.array(microsoft_graph_calendarPermission)
+}).partial().passthrough();
 const get_schedule_Body = z.object({
   Schedules: z.array(z.string().nullable()),
   EndTime: z.union([microsoft_graph_dateTimeTimeZone, z.object({}).partial().passthrough()]),
@@ -1913,30 +2042,6 @@ const microsoft_graph_calendarColor = z.enum([
   "lightRed",
   "maxColor"
 ]);
-const microsoft_graph_calendarRoleType = z.enum([
-  "none",
-  "freeBusyRead",
-  "limitedRead",
-  "read",
-  "write",
-  "delegateWithoutPrivateEventAccess",
-  "delegateWithPrivateEventAccess",
-  "custom"
-]);
-const microsoft_graph_calendarPermission = z.object({
-  id: z.string().describe("The unique identifier for an entity. Read-only.").optional(),
-  allowedRoles: z.array(z.union([microsoft_graph_calendarRoleType, z.object({}).partial().passthrough()])).describe(
-    "List of allowed sharing or delegating permission levels for the calendar. The possible values are: none, freeBusyRead, limitedRead, read, write, delegateWithoutPrivateEventAccess, delegateWithPrivateEventAccess, custom."
-  ).optional(),
-  emailAddress: microsoft_graph_emailAddress.optional(),
-  isInsideOrganization: z.boolean().describe(
-    "True if the user in context (recipient or delegate) is inside the same organization as the calendar owner."
-  ).nullish(),
-  isRemovable: z.boolean().describe(
-    "True if the user can be removed from the list of recipients or delegates for the specified calendar, false otherwise. The 'My organization' user determines the permissions other people within your organization have to the given calendar. You can't remove 'My organization' as a share recipient to a calendar."
-  ).nullish(),
-  role: microsoft_graph_calendarRoleType.optional()
-}).passthrough();
 const microsoft_graph_calendar = z.object({
   id: z.string().describe("The unique identifier for an entity. Read-only.").optional(),
   allowedOnlineMeetingProviders: z.array(z.union([microsoft_graph_onlineMeetingProviderType, z.object({}).partial().passthrough()])).describe(
@@ -2035,6 +2140,28 @@ const microsoft_graph_contact = z.object({
   imAddresses: z.array(z.string().nullable()).describe("The contact's instant messaging (IM) addresses.").optional(),
   initials: z.string().describe("The contact's initials.").nullish()
 }).passthrough().passthrough();
+const microsoft_graph_contactFolder = z.lazy(
+  () => z.object({
+    id: z.string().describe("The unique identifier for an entity. Read-only.").optional(),
+    displayName: z.string().describe("The folder's display name.").nullish(),
+    parentFolderId: z.string().describe("The ID of the folder's parent folder.").nullish(),
+    childFolders: z.array(microsoft_graph_contactFolder).describe(
+      "The collection of child folders in the folder. Navigation property. Read-only. Nullable."
+    ).optional(),
+    contacts: z.array(microsoft_graph_contact).describe("The contacts in the folder. Navigation property. Read-only. Nullable.").optional(),
+    multiValueExtendedProperties: z.array(microsoft_graph_multiValueLegacyExtendedProperty).describe(
+      "The collection of multi-value extended properties defined for the contactFolder. Read-only. Nullable."
+    ).optional(),
+    singleValueExtendedProperties: z.array(microsoft_graph_singleValueLegacyExtendedProperty).describe(
+      "The collection of single-value extended properties defined for the contactFolder. Read-only. Nullable."
+    ).optional()
+  }).passthrough()
+);
+const microsoft_graph_contactFolderCollectionResponse = z.object({
+  "@odata.count": z.number().int().nullable(),
+  "@odata.nextLink": z.string().nullable(),
+  value: z.array(microsoft_graph_contactFolder)
+}).partial().passthrough();
 const microsoft_graph_contactCollectionResponse = z.object({
   "@odata.count": z.number().int().nullable(),
   "@odata.nextLink": z.string().nullable(),
@@ -3100,6 +3227,20 @@ const microsoft_graph_attachmentCollectionResponse = z.object({
   "@odata.nextLink": z.string().nullable(),
   value: z.array(microsoft_graph_attachment)
 }).partial().passthrough();
+const microsoft_graph_attachmentType = z.enum(["file", "item", "reference"]);
+const microsoft_graph_attachmentItem = z.object({
+  attachmentType: microsoft_graph_attachmentType.optional(),
+  contentId: z.string().describe(
+    "The CID or Content-Id of the attachment for referencing for the in-line attachments using the <img src='cid:contentId'> tag in HTML messages. Optional."
+  ).nullish(),
+  contentType: z.string().describe("The nature of the data in the attachment. Optional.").nullish(),
+  isInline: z.boolean().describe("true if the attachment is an inline attachment; otherwise, false. Optional.").nullish(),
+  name: z.string().describe(
+    "The display name of the attachment. This can be a descriptive string and doesn't have to be the actual file name. Required."
+  ).nullish(),
+  size: z.number().describe("The length of the attachment in bytes. Required.").nullish()
+}).passthrough();
+const create_mail_attachment_upload_session_Body = z.object({ AttachmentItem: microsoft_graph_attachmentItem }).partial().passthrough();
 const create_forward_draft_Body = z.object({
   ToRecipients: z.array(microsoft_graph_recipient),
   Message: z.union([microsoft_graph_message, z.object({}).partial().passthrough()]),
@@ -3152,6 +3293,22 @@ const find_meeting_times_Body = z.object({
   isOrganizerOptional: z.boolean().nullable().default(false),
   returnSuggestionReasons: z.boolean().nullable().default(false),
   minimumAttendeePercentage: z.union([z.number(), z.string(), ReferenceNumeric])
+}).partial().passthrough();
+const microsoft_graph_mailTipsType = z.enum([
+  "automaticReplies",
+  "mailboxFullStatus",
+  "customMailTip",
+  "externalMemberCount",
+  "totalMemberCount",
+  "maxMessageSize",
+  "deliveryRestriction",
+  "moderationStatus",
+  "recipientScope",
+  "recipientSuggestions"
+]);
+const get_mail_tips_Body = z.object({
+  EmailAddresses: z.array(z.string()),
+  MailTipsOptions: z.union([microsoft_graph_mailTipsType, z.object({}).partial().passthrough()])
 }).partial().passthrough();
 const send_mail_Body = z.object({
   Message: microsoft_graph_message.describe(
@@ -3298,10 +3455,36 @@ const microsoft_graph_onenoteSectionCollectionResponse = z.object({
   "@odata.nextLink": z.string().nullable(),
   value: z.array(microsoft_graph_onenoteSection)
 }).partial().passthrough();
+const microsoft_graph_CopyNotebookModel = z.object({
+  createdBy: z.string().nullish(),
+  createdByIdentity: microsoft_graph_identitySet.optional(),
+  createdTime: z.string().regex(
+    /^[0-9]{4,}-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{1,12})?(Z|[+-][0-9][0-9]:[0-9][0-9])$/
+  ).datetime({ offset: true }).nullish(),
+  id: z.string().nullish(),
+  isDefault: z.boolean().nullish(),
+  isShared: z.boolean().nullish(),
+  lastModifiedBy: z.string().nullish(),
+  lastModifiedByIdentity: microsoft_graph_identitySet.optional(),
+  lastModifiedTime: z.string().regex(
+    /^[0-9]{4,}-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{1,12})?(Z|[+-][0-9][0-9]:[0-9][0-9])$/
+  ).datetime({ offset: true }).nullish(),
+  links: microsoft_graph_notebookLinks.optional(),
+  name: z.string().nullish(),
+  sectionGroupsUrl: z.string().nullish(),
+  sectionsUrl: z.string().nullish(),
+  self: z.string().nullish(),
+  userRole: microsoft_graph_onenoteUserRole.optional()
+}).passthrough();
 const microsoft_graph_onenotePageCollectionResponse = z.object({
   "@odata.count": z.number().int().nullable(),
   "@odata.nextLink": z.string().nullable(),
   value: z.array(microsoft_graph_onenotePage)
+}).partial().passthrough();
+const microsoft_graph_sectionGroupCollectionResponse = z.object({
+  "@odata.count": z.number().int().nullable(),
+  "@odata.nextLink": z.string().nullable(),
+  value: z.array(microsoft_graph_sectionGroup)
 }).partial().passthrough();
 const microsoft_graph_allowedLobbyAdmitterRoles = z.enum([
   "organizerAndCoOrganizersAndPresenters",
@@ -3547,6 +3730,10 @@ const microsoft_graph_outlookCategoryCollectionResponse = z.object({
   "@odata.nextLink": z.string().nullable(),
   value: z.array(microsoft_graph_outlookCategory)
 }).partial().passthrough();
+const microsoft_graph_timeZoneInformation = z.object({
+  alias: z.string().describe("An identifier for the time zone.").nullish(),
+  displayName: z.string().describe("A display string that represents the time zone.").nullish()
+}).passthrough();
 const microsoft_graph_personType = z.object({
   class: z.string().describe("The type of data source, such as Person.").nullish(),
   subclass: z.string().describe("The secondary type of data source, such as OrganizationUser.").nullish()
@@ -3706,6 +3893,69 @@ const microsoft_graph_plannerTaskCollectionResponse = z.object({
   "@odata.count": z.number().int().nullable(),
   "@odata.nextLink": z.string().nullable(),
   value: z.array(microsoft_graph_plannerTask)
+}).partial().passthrough();
+const set_my_presence_Body = z.object({
+  sessionId: z.string().nullable(),
+  availability: z.string(),
+  activity: z.string(),
+  expirationDuration: z.string().regex(/^-?P([0-9]+D)?(T([0-9]+H)?([0-9]+M)?([0-9]+([.][0-9]+)?S)?)?$/).nullable()
+}).partial().passthrough();
+const set_my_status_message_Body = z.object({
+  statusMessage: z.union([
+    microsoft_graph_presenceStatusMessage,
+    z.object({}).partial().passthrough()
+  ])
+}).partial().passthrough();
+const set_my_user_preferred_presence_Body = z.object({
+  availability: z.string(),
+  activity: z.string(),
+  expirationDuration: z.string().regex(/^-?P([0-9]+D)?(T([0-9]+H)?([0-9]+M)?([0-9]+([.][0-9]+)?S)?)?$/).nullable()
+}).partial().passthrough();
+const microsoft_graph_associatedTeamInfo = z.object({
+  id: z.string().describe("The unique identifier for an entity. Read-only.").optional(),
+  displayName: z.string().describe("The name of the team.").nullish(),
+  tenantId: z.string().describe("The ID of the Microsoft Entra tenant.").nullish(),
+  team: microsoft_graph_team.describe("[Note: Simplified from 30 properties to 25 most common ones]").optional()
+}).passthrough();
+const microsoft_graph_associatedTeamInfoCollectionResponse = z.object({
+  "@odata.count": z.number().int().nullable(),
+  "@odata.nextLink": z.string().nullable(),
+  value: z.array(microsoft_graph_associatedTeamInfo)
+}).partial().passthrough();
+const microsoft_graph_userScopeTeamsAppInstallation = z.object({
+  id: z.string().describe("The unique identifier for an entity. Read-only.").optional(),
+  consentedPermissionSet: microsoft_graph_teamsAppPermissionSet.optional(),
+  teamsApp: microsoft_graph_teamsApp.optional(),
+  teamsAppDefinition: microsoft_graph_teamsAppDefinition.optional(),
+  chat: microsoft_graph_chat.optional()
+}).passthrough();
+const microsoft_graph_userScopeTeamsAppInstallationCollectionResponse = z.object({
+  "@odata.count": z.number().int().nullable(),
+  "@odata.nextLink": z.string().nullable(),
+  value: z.array(microsoft_graph_userScopeTeamsAppInstallation)
+}).partial().passthrough();
+const microsoft_graph_teamworkActivityTopicSource = z.enum(["entityUrl", "text"]);
+const microsoft_graph_teamworkActivityTopic = z.object({
+  source: microsoft_graph_teamworkActivityTopicSource.optional(),
+  value: z.string().describe(
+    "The topic value. If the value of the source property is entityUrl, this must be a Microsoft Graph URL. If the value is text, this must be a plain text value."
+  ).optional(),
+  webUrl: z.string().describe(
+    "The link the user clicks when they select the notification. Optional when source is entityUrl; required when source is text."
+  ).nullish()
+}).passthrough();
+const microsoft_graph_keyValuePair = z.object({
+  name: z.string().describe("Name for this key-value pair").optional(),
+  value: z.string().describe("Value for this key-value pair").nullish()
+}).passthrough();
+const send_my_activity_notification_Body = z.object({
+  topic: z.union([microsoft_graph_teamworkActivityTopic, z.object({}).partial().passthrough()]),
+  activityType: z.string().nullable(),
+  chainId: z.number().nullable(),
+  previewText: z.union([microsoft_graph_itemBody, z.object({}).partial().passthrough()]),
+  teamsAppId: z.string().nullable(),
+  templateParameters: z.array(microsoft_graph_keyValuePair),
+  iconId: z.string().nullable()
 }).partial().passthrough();
 const microsoft_graph_wellknownListName = z.enum([
   "none",
@@ -4550,6 +4800,8 @@ const schemas = {
   microsoft_graph_chatMessageCollectionResponse,
   microsoft_graph_chatMessageHostedContentCollectionResponse,
   microsoft_graph_pinnedChatMessageInfoCollectionResponse,
+  get_presences_by_user_id_Body,
+  BaseCollectionPaginationCountResponse,
   microsoft_graph_outOfOfficeSettings,
   microsoft_graph_dateTimeTimeZone,
   microsoft_graph_presenceStatusMessage,
@@ -4557,6 +4809,13 @@ const schemas = {
   microsoft_graph_workLocationType,
   microsoft_graph_userWorkLocation,
   microsoft_graph_presence,
+  copilot_retrieve_Body,
+  microsoft_graph_retrievalExtract,
+  microsoft_graph_searchResourceMetadataDictionary,
+  microsoft_graph_retrievalEntityType,
+  microsoft_graph_sensitivityLabelInfo,
+  microsoft_graph_retrievalHit,
+  microsoft_graph_retrievalResponse,
   microsoft_graph_geoCoordinates,
   microsoft_graph_sharepointIds,
   microsoft_graph_itemReference,
@@ -4582,6 +4841,7 @@ const schemas = {
   microsoft_graph_driveItem,
   microsoft_graph_driveItemCollectionResponse,
   copy_drive_item_Body,
+  microsoft_graph_driveRecipient,
   create_drive_item_share_link_Body,
   microsoft_graph_sharePointGroupIdentity,
   microsoft_graph_sharePointIdentity,
@@ -4589,6 +4849,11 @@ const schemas = {
   microsoft_graph_sharingInvitation,
   microsoft_graph_sharingLink,
   microsoft_graph_permission,
+  microsoft_graph_driveItemSourceApplication,
+  microsoft_graph_driveItemSource,
+  microsoft_graph_mediaSourceContentCategory,
+  microsoft_graph_mediaSource,
+  microsoft_graph_driveItemUploadableProperties,
   create_upload_session_Body,
   microsoft_graph_uploadSession,
   BaseDeltaFunctionResponse,
@@ -4596,7 +4861,6 @@ const schemas = {
   microsoft_graph_sensitivityLabelAssignment,
   microsoft_graph_extractSensitivityLabelsResult,
   share_drive_item_Body,
-  BaseCollectionPaginationCountResponse,
   ReferenceNumeric,
   create_drive_item_preview_Body,
   microsoft_graph_itemPreviewInfo,
@@ -4696,6 +4960,9 @@ const schemas = {
   ReferenceCreate,
   microsoft_graph_conversationThreadCollectionResponse,
   reply_to_group_thread_Body,
+  microsoft_graph_calendarRoleType,
+  microsoft_graph_calendarPermission,
+  microsoft_graph_calendarPermissionCollectionResponse,
   get_schedule_Body,
   microsoft_graph_freeBusyError,
   microsoft_graph_scheduleItem,
@@ -4704,12 +4971,12 @@ const schemas = {
   microsoft_graph_scheduleInformation,
   microsoft_graph_onlineMeetingProviderType,
   microsoft_graph_calendarColor,
-  microsoft_graph_calendarRoleType,
-  microsoft_graph_calendarPermission,
   microsoft_graph_calendar,
   microsoft_graph_calendarCollectionResponse,
   microsoft_graph_chatCollectionResponse,
   microsoft_graph_contact,
+  microsoft_graph_contactFolder,
+  microsoft_graph_contactFolderCollectionResponse,
   microsoft_graph_contactCollectionResponse,
   microsoft_graph_labelActionSource,
   microsoft_graph_usageRights,
@@ -4811,6 +5078,9 @@ const schemas = {
   microsoft_graph_messageRuleCollectionResponse,
   microsoft_graph_messageCollectionResponse,
   microsoft_graph_attachmentCollectionResponse,
+  microsoft_graph_attachmentType,
+  microsoft_graph_attachmentItem,
+  create_mail_attachment_upload_session_Body,
   create_forward_draft_Body,
   create_reply_draft_Body,
   microsoft_graph_attendeeBase,
@@ -4819,6 +5089,8 @@ const schemas = {
   microsoft_graph_activityDomain,
   microsoft_graph_timeConstraint,
   find_meeting_times_Body,
+  microsoft_graph_mailTipsType,
+  get_mail_tips_Body,
   send_mail_Body,
   microsoft_graph_externalLink,
   microsoft_graph_notebookLinks,
@@ -4831,7 +5103,9 @@ const schemas = {
   microsoft_graph_notebook,
   microsoft_graph_notebookCollectionResponse,
   microsoft_graph_onenoteSectionCollectionResponse,
+  microsoft_graph_CopyNotebookModel,
   microsoft_graph_onenotePageCollectionResponse,
+  microsoft_graph_sectionGroupCollectionResponse,
   microsoft_graph_allowedLobbyAdmitterRoles,
   microsoft_graph_onlineMeetingPresenters,
   microsoft_graph_meetingLiveShareOptions,
@@ -4856,6 +5130,7 @@ const schemas = {
   microsoft_graph_categoryColor,
   microsoft_graph_outlookCategory,
   microsoft_graph_outlookCategoryCollectionResponse,
+  microsoft_graph_timeZoneInformation,
   microsoft_graph_personType,
   microsoft_graph_phoneType,
   microsoft_graph_phone,
@@ -4876,6 +5151,17 @@ const schemas = {
   microsoft_graph_plannerBucketTaskBoardTaskFormat,
   microsoft_graph_plannerTask,
   microsoft_graph_plannerTaskCollectionResponse,
+  set_my_presence_Body,
+  set_my_status_message_Body,
+  set_my_user_preferred_presence_Body,
+  microsoft_graph_associatedTeamInfo,
+  microsoft_graph_associatedTeamInfoCollectionResponse,
+  microsoft_graph_userScopeTeamsAppInstallation,
+  microsoft_graph_userScopeTeamsAppInstallationCollectionResponse,
+  microsoft_graph_teamworkActivityTopicSource,
+  microsoft_graph_teamworkActivityTopic,
+  microsoft_graph_keyValuePair,
+  send_my_activity_notification_Body,
   microsoft_graph_wellknownListName,
   microsoft_graph_taskStatus,
   microsoft_graph_attachmentBase,
@@ -5381,16 +5667,32 @@ const endpoints = makeApi([
   },
   {
     method: "post",
-    path: "/communications/presences",
+    path: "/communications/getPresencesByUserId",
     alias: "get-presences-by-user-id",
-    description: `Create new navigation property to presences for communications`,
+    description: `Get the presence information for multiple users.`,
     requestFormat: "json",
     parameters: [
       {
         name: "body",
-        description: `New navigation property`,
+        description: `Action parameters`,
         type: "Body",
-        schema: microsoft_graph_presence
+        schema: get_presences_by_user_id_Body
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "post",
+    path: "/copilot/retrieval",
+    alias: "copilot-retrieve",
+    description: `Invoke action retrieval`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "body",
+        description: `Action parameters`,
+        type: "Body",
+        schema: copilot_retrieve_Body
       }
     ],
     response: z.void()
@@ -7133,6 +7435,103 @@ from the default calendar of a group.`,
     response: z.void()
   },
   {
+    method: "get",
+    path: "/me/calendar/calendarPermissions",
+    alias: "list-my-calendar-permissions",
+    description: `The permissions of the users with whom the calendar is shared.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "$top",
+        type: "Query",
+        schema: z.number().int().gte(0).describe("Show only the first n items").optional()
+      },
+      {
+        name: "$skip",
+        type: "Query",
+        schema: z.number().int().gte(0).describe("Skip the first n items").optional()
+      },
+      {
+        name: "$search",
+        type: "Query",
+        schema: z.string().describe("Search items by search phrases").optional()
+      },
+      {
+        name: "$filter",
+        type: "Query",
+        schema: z.string().describe("Filter items by property values").optional()
+      },
+      {
+        name: "$count",
+        type: "Query",
+        schema: z.boolean().describe("Include count of items").optional()
+      },
+      {
+        name: "$orderby",
+        type: "Query",
+        schema: z.array(z.string()).describe("Order items by property values").optional()
+      },
+      {
+        name: "$select",
+        type: "Query",
+        schema: z.array(z.string()).describe("Select properties to be returned").optional()
+      },
+      {
+        name: "$expand",
+        type: "Query",
+        schema: z.array(z.string()).describe("Expand related entities").optional()
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "post",
+    path: "/me/calendar/calendarPermissions",
+    alias: "create-my-calendar-permission",
+    description: `Create a calendarPermission resource to specify the identity and role of the user with whom the specified calendar is being shared or delegated.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "body",
+        description: `New navigation property`,
+        type: "Body",
+        schema: microsoft_graph_calendarPermission
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "patch",
+    path: "/me/calendar/calendarPermissions/:calendarPermissionId",
+    alias: "update-my-calendar-permission",
+    description: `Update the navigation property calendarPermissions in me`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "body",
+        description: `New navigation property values`,
+        type: "Body",
+        schema: microsoft_graph_calendarPermission
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "delete",
+    path: "/me/calendar/calendarPermissions/:calendarPermissionId",
+    alias: "delete-my-calendar-permission",
+    description: `Delete navigation property calendarPermissions for me`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "If-Match",
+        type: "Header",
+        schema: z.string().describe("ETag").optional()
+      }
+    ],
+    response: z.void()
+  },
+  {
     method: "post",
     path: "/me/calendar/getSchedule",
     alias: "get-schedule",
@@ -7769,6 +8168,281 @@ or from some other calendar of the user.`,
         name: "$expand",
         type: "Query",
         schema: z.array(z.string()).describe("Expand related entities").optional()
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "get",
+    path: "/me/contactFolders",
+    alias: "list-contact-folders",
+    description: `Get the contact folder collection in the default Contacts folder of the signed-in user.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "$top",
+        type: "Query",
+        schema: z.number().int().gte(0).describe("Show only the first n items").optional()
+      },
+      {
+        name: "$skip",
+        type: "Query",
+        schema: z.number().int().gte(0).describe("Skip the first n items").optional()
+      },
+      {
+        name: "$search",
+        type: "Query",
+        schema: z.string().describe("Search items by search phrases").optional()
+      },
+      {
+        name: "$filter",
+        type: "Query",
+        schema: z.string().describe("Filter items by property values").optional()
+      },
+      {
+        name: "$count",
+        type: "Query",
+        schema: z.boolean().describe("Include count of items").optional()
+      },
+      {
+        name: "$orderby",
+        type: "Query",
+        schema: z.array(z.string()).describe("Order items by property values").optional()
+      },
+      {
+        name: "$select",
+        type: "Query",
+        schema: z.array(z.string()).describe("Select properties to be returned").optional()
+      },
+      {
+        name: "$expand",
+        type: "Query",
+        schema: z.array(z.string()).describe("Expand related entities").optional()
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "post",
+    path: "/me/contactFolders",
+    alias: "create-contact-folder",
+    description: `Create a new contactFolder under the user's default contacts folder. You can also create a new contactfolder as a child of any specified contact folder.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "body",
+        description: `New navigation property`,
+        type: "Body",
+        schema: microsoft_graph_contactFolder
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "patch",
+    path: "/me/contactFolders/:contactFolderId",
+    alias: "update-contact-folder",
+    description: `Update the properties of contactfolder object.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "body",
+        description: `New navigation property values`,
+        type: "Body",
+        schema: microsoft_graph_contactFolder
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "delete",
+    path: "/me/contactFolders/:contactFolderId",
+    alias: "delete-contact-folder",
+    description: `Delete contactFolder other than the default contactFolder.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "If-Match",
+        type: "Header",
+        schema: z.string().describe("ETag").optional()
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "get",
+    path: "/me/contactFolders/:contactFolderId/childFolders",
+    alias: "list-contact-folder-child-folders",
+    description: `Get a collection of child folders under the specified contact folder.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "$top",
+        type: "Query",
+        schema: z.number().int().gte(0).describe("Show only the first n items").optional()
+      },
+      {
+        name: "$skip",
+        type: "Query",
+        schema: z.number().int().gte(0).describe("Skip the first n items").optional()
+      },
+      {
+        name: "$search",
+        type: "Query",
+        schema: z.string().describe("Search items by search phrases").optional()
+      },
+      {
+        name: "$filter",
+        type: "Query",
+        schema: z.string().describe("Filter items by property values").optional()
+      },
+      {
+        name: "$count",
+        type: "Query",
+        schema: z.boolean().describe("Include count of items").optional()
+      },
+      {
+        name: "$orderby",
+        type: "Query",
+        schema: z.array(z.string()).describe("Order items by property values").optional()
+      },
+      {
+        name: "$select",
+        type: "Query",
+        schema: z.array(z.string()).describe("Select properties to be returned").optional()
+      },
+      {
+        name: "$expand",
+        type: "Query",
+        schema: z.array(z.string()).describe("Expand related entities").optional()
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "post",
+    path: "/me/contactFolders/:contactFolderId/childFolders",
+    alias: "create-contact-child-folder",
+    description: `Create a new contactFolder as a child of a specified folder.  You can also create a new contactFolder under the user's default contact folder.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "body",
+        description: `New navigation property`,
+        type: "Body",
+        schema: microsoft_graph_contactFolder
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "get",
+    path: "/me/contactFolders/:contactFolderId/contacts",
+    alias: "list-contact-folder-contacts",
+    description: `Get a contact collection from the default Contacts folder of the signed-in user (.../me/contacts), or from the specified contact folder.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "$top",
+        type: "Query",
+        schema: z.number().int().gte(0).describe("Show only the first n items").optional()
+      },
+      {
+        name: "$skip",
+        type: "Query",
+        schema: z.number().int().gte(0).describe("Skip the first n items").optional()
+      },
+      {
+        name: "$search",
+        type: "Query",
+        schema: z.string().describe("Search items by search phrases").optional()
+      },
+      {
+        name: "$filter",
+        type: "Query",
+        schema: z.string().describe("Filter items by property values").optional()
+      },
+      {
+        name: "$count",
+        type: "Query",
+        schema: z.boolean().describe("Include count of items").optional()
+      },
+      {
+        name: "$orderby",
+        type: "Query",
+        schema: z.array(z.string()).describe("Order items by property values").optional()
+      },
+      {
+        name: "$select",
+        type: "Query",
+        schema: z.array(z.string()).describe("Select properties to be returned").optional()
+      },
+      {
+        name: "$expand",
+        type: "Query",
+        schema: z.array(z.string()).describe("Expand related entities").optional()
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "post",
+    path: "/me/contactFolders/:contactFolderId/contacts",
+    alias: "create-contact-in-folder",
+    description: `Add a contact to the root Contacts folder or to the contacts endpoint of another contact folder.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "body",
+        description: `New navigation property`,
+        type: "Body",
+        schema: z.object({
+          id: z.string().describe("The unique identifier for an entity. Read-only.").optional(),
+          displayName: z.string().describe(
+            "The contact's display name. You can specify the display name in a create or update operation. Note that later updates to other properties may cause an automatically generated value to overwrite the displayName value you have specified. To preserve a pre-existing value, always include it as displayName in an update operation."
+          ).nullish(),
+          createdDateTime: z.string().regex(
+            /^[0-9]{4,}-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{1,12})?(Z|[+-][0-9][0-9]:[0-9][0-9])$/
+          ).datetime({ offset: true }).describe(
+            "The Timestamp type represents date and time information using ISO 8601 format and is always in UTC time. For example, midnight UTC on Jan 1, 2014 is 2014-01-01T00:00:00Z"
+          ).nullish(),
+          lastModifiedDateTime: z.string().regex(
+            /^[0-9]{4,}-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{1,12})?(Z|[+-][0-9][0-9]:[0-9][0-9])$/
+          ).datetime({ offset: true }).describe(
+            "The Timestamp type represents date and time information using ISO 8601 format and is always in UTC time. For example, midnight UTC on Jan 1, 2014 is 2014-01-01T00:00:00Z"
+          ).nullish(),
+          title: z.string().describe("The contact's title.").nullish(),
+          singleValueExtendedProperties: z.array(microsoft_graph_singleValueLegacyExtendedProperty).describe(
+            "The collection of single-value extended properties defined for the contact. Read-only. Nullable."
+          ).optional(),
+          multiValueExtendedProperties: z.array(microsoft_graph_multiValueLegacyExtendedProperty).describe(
+            "The collection of multi-value extended properties defined for the contact. Read-only. Nullable."
+          ).optional(),
+          categories: z.array(z.string().nullable()).describe("The categories associated with the item").optional(),
+          changeKey: z.string().describe(
+            "Identifies the version of the item. Every time the item is changed, changeKey changes as well. This allows Exchange to apply changes to the correct version of the object. Read-only."
+          ).nullish(),
+          assistantName: z.string().describe("The name of the contact's assistant.").nullish(),
+          birthday: z.string().regex(
+            /^[0-9]{4,}-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{1,12})?(Z|[+-][0-9][0-9]:[0-9][0-9])$/
+          ).datetime({ offset: true }).describe(
+            "The contact's birthday. The Timestamp type represents date and time information using ISO 8601 format and is always in UTC time. For example, midnight UTC on Jan 1, 2014 is 2014-01-01T00:00:00Z"
+          ).nullish(),
+          businessAddress: microsoft_graph_physicalAddress.optional(),
+          businessHomePage: z.string().describe("The business home page of the contact.").nullish(),
+          businessPhones: z.array(z.string().nullable()).describe("The contact's business phone numbers.").optional(),
+          children: z.array(z.string().nullable()).describe("The names of the contact's children.").optional(),
+          companyName: z.string().describe("The name of the contact's company.").nullish(),
+          department: z.string().describe("The contact's department.").nullish(),
+          emailAddresses: z.array(microsoft_graph_emailAddress).describe("The contact's email addresses.").optional(),
+          fileAs: z.string().describe("The name the contact is filed under.").nullish(),
+          generation: z.string().describe("The contact's suffix.").nullish(),
+          givenName: z.string().describe("The contact's given name.").nullish(),
+          homeAddress: microsoft_graph_physicalAddress.optional(),
+          homePhones: z.array(z.string().nullable()).describe("The contact's home phone numbers.").optional(),
+          imAddresses: z.array(z.string().nullable()).describe("The contact's instant messaging (IM) addresses.").optional(),
+          initials: z.string().describe("The contact's initials.").nullish()
+        }).passthrough().passthrough()
       }
     ],
     response: z.void()
@@ -8570,6 +9244,23 @@ Based on this value, you can better adjust the parameters and call findMeetingTi
         description: `Action parameters`,
         type: "Body",
         schema: find_meeting_times_Body
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "post",
+    path: "/me/getMailTips",
+    alias: "get-mail-tips",
+    description: `Get the MailTips of one or more recipients as available to the signed-in user. Note that by making a POST call to the getMailTips action, you can request specific types of MailTips to
+be returned for more than one recipient at one time. The requested MailTips are returned in a mailTips collection.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "body",
+        description: `Action parameters`,
+        type: "Body",
+        schema: get_mail_tips_Body
       }
     ],
     response: z.void()
@@ -9596,7 +10287,7 @@ resource.`,
         name: "body",
         description: `Action parameters`,
         type: "Body",
-        schema: z.object({ AttachmentItem: z.object({}).partial().passthrough() }).partial().passthrough()
+        schema: create_mail_attachment_upload_session_Body
       }
     ],
     response: z.void()
@@ -9893,6 +10584,72 @@ resource.`,
   },
   {
     method: "post",
+    path: "/me/onenote/notebooks/getNotebookFromWebUrl",
+    alias: "get-onenote-notebook-from-web-url",
+    description: `Retrieve the properties and relationships of a notebook object by using its URL path. The location can be user notebooks on Microsoft 365, group notebooks, or SharePoint site-hosted team notebooks on Microsoft 365.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "body",
+        description: `Action parameters`,
+        type: "Body",
+        schema: z.object({ webUrl: z.string().nullable() }).partial().passthrough()
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "get",
+    path: "/me/onenote/pages",
+    alias: "list-onenote-pages",
+    description: `Retrieve a list of page objects.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "$top",
+        type: "Query",
+        schema: z.number().int().gte(0).describe("Show only the first n items").optional()
+      },
+      {
+        name: "$skip",
+        type: "Query",
+        schema: z.number().int().gte(0).describe("Skip the first n items").optional()
+      },
+      {
+        name: "$search",
+        type: "Query",
+        schema: z.string().describe("Search items by search phrases").optional()
+      },
+      {
+        name: "$filter",
+        type: "Query",
+        schema: z.string().describe("Filter items by property values").optional()
+      },
+      {
+        name: "$count",
+        type: "Query",
+        schema: z.boolean().describe("Include count of items").optional()
+      },
+      {
+        name: "$orderby",
+        type: "Query",
+        schema: z.array(z.string()).describe("Order items by property values").optional()
+      },
+      {
+        name: "$select",
+        type: "Query",
+        schema: z.array(z.string()).describe("Select properties to be returned").optional()
+      },
+      {
+        name: "$expand",
+        type: "Query",
+        schema: z.array(z.string()).describe("Expand related entities").optional()
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "post",
     path: "/me/onenote/pages",
     alias: "create-onenote-page",
     description: `Create a new OneNote page in the default section of the default notebook. To create a page in a different section in the default notebook, you can use the sectionName query parameter.  Example: ../onenote/pages?sectionName=My%20section The POST /onenote/pages operation is used only to create pages in the current user's default notebook. If you're targeting other notebooks, you can create pages in a specified section.  `,
@@ -9928,6 +10685,56 @@ resource.`,
     alias: "get-onenote-page-content",
     description: `The page's HTML content.`,
     requestFormat: "json",
+    response: z.void()
+  },
+  {
+    method: "get",
+    path: "/me/onenote/sectionGroups",
+    alias: "list-onenote-section-groups",
+    description: `Retrieve a list of sectionGroup objects.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "$top",
+        type: "Query",
+        schema: z.number().int().gte(0).describe("Show only the first n items").optional()
+      },
+      {
+        name: "$skip",
+        type: "Query",
+        schema: z.number().int().gte(0).describe("Skip the first n items").optional()
+      },
+      {
+        name: "$search",
+        type: "Query",
+        schema: z.string().describe("Search items by search phrases").optional()
+      },
+      {
+        name: "$filter",
+        type: "Query",
+        schema: z.string().describe("Filter items by property values").optional()
+      },
+      {
+        name: "$count",
+        type: "Query",
+        schema: z.boolean().describe("Include count of items").optional()
+      },
+      {
+        name: "$orderby",
+        type: "Query",
+        schema: z.array(z.string()).describe("Order items by property values").optional()
+      },
+      {
+        name: "$select",
+        type: "Query",
+        schema: z.array(z.string()).describe("Select properties to be returned").optional()
+      },
+      {
+        name: "$expand",
+        type: "Query",
+        schema: z.array(z.string()).describe("Expand related entities").optional()
+      }
+    ],
     response: z.void()
   },
   {
@@ -10579,6 +11386,78 @@ resource.`,
   },
   {
     method: "get",
+    path: "/me/outlook/supportedLanguages()",
+    alias: "list-supported-languages",
+    description: `Get the list of locales and languages that are supported for the user, as configured on the user's mailbox server. When setting up an Outlook client, the user selects the preferred language from this supported list. You can subsequently get the preferred language by
+getting the user's mailbox settings.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "$top",
+        type: "Query",
+        schema: z.number().int().gte(0).describe("Show only the first n items").optional()
+      },
+      {
+        name: "$skip",
+        type: "Query",
+        schema: z.number().int().gte(0).describe("Skip the first n items").optional()
+      },
+      {
+        name: "$search",
+        type: "Query",
+        schema: z.string().describe("Search items by search phrases").optional()
+      },
+      {
+        name: "$filter",
+        type: "Query",
+        schema: z.string().describe("Filter items by property values").optional()
+      },
+      {
+        name: "$count",
+        type: "Query",
+        schema: z.boolean().describe("Include count of items").optional()
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "get",
+    path: `/me/outlook/supportedTimeZones(TimeZoneStandard=':TimeZoneStandard')`,
+    alias: "list-supported-time-zones",
+    description: `Get the list of time zones that are supported for the user, as configured on the user's mailbox server. You can explicitly specify to have time zones returned in the Windows time zone format or  Internet Assigned Numbers Authority (IANA) time zone (also known as Olson time zone) format. The Windows format is the default. When setting up an Outlook client, the user selects the preferred time zone from this supported list. You can subsequently get the preferred time zone by
+getting the user's mailbox settings.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "$top",
+        type: "Query",
+        schema: z.number().int().gte(0).describe("Show only the first n items").optional()
+      },
+      {
+        name: "$skip",
+        type: "Query",
+        schema: z.number().int().gte(0).describe("Skip the first n items").optional()
+      },
+      {
+        name: "$search",
+        type: "Query",
+        schema: z.string().describe("Search items by search phrases").optional()
+      },
+      {
+        name: "$filter",
+        type: "Query",
+        schema: z.string().describe("Filter items by property values").optional()
+      },
+      {
+        name: "$count",
+        type: "Query",
+        schema: z.boolean().describe("Include count of items").optional()
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "get",
     path: "/me/people",
     alias: "list-relevant-people",
     description: `Retrieve a collection of person objects ordered by their relevance to the user, which is determined by the user's communication and collaboration patterns, and business relationships. You can get this information via the People API. For examples, see the Examples section and the article Use the People API to get information about the people most relevant to you.`,
@@ -10623,6 +11502,22 @@ resource.`,
         name: "$expand",
         type: "Query",
         schema: z.array(z.string()).describe("Expand related entities").optional()
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "put",
+    path: "/me/photo/$value",
+    alias: "upload-my-profile-photo",
+    description: `Update the photo for the specified contact, group, team, or user in a tenant. The size of the photo you can update to is limited to 4 MB. You can use either PATCH or PUT for this operation.`,
+    requestFormat: "binary",
+    parameters: [
+      {
+        name: "body",
+        description: `New media content.`,
+        type: "Body",
+        schema: z.string().describe("Base64-encoded file content. The server decodes it and PUTs the raw bytes to Microsoft Graph.")
       }
     ],
     response: z.void()
@@ -10699,6 +11594,78 @@ resource.`,
   },
   {
     method: "post",
+    path: "/me/presence/clearPresence",
+    alias: "clear-my-presence",
+    description: `Clear the application's presence session for a user. If it is the user's only presence session, the user's presence will change to Offline/Offline. For details about presences sessions, see presence: setPresence.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "body",
+        description: `Action parameters`,
+        type: "Body",
+        schema: z.object({ sessionId: z.string().nullable() }).partial().passthrough()
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "post",
+    path: "/me/presence/clearUserPreferredPresence",
+    alias: "clear-my-user-preferred-presence",
+    description: `Clear the preferred availability and activity status for a user.`,
+    requestFormat: "json",
+    response: z.void()
+  },
+  {
+    method: "post",
+    path: "/me/presence/setPresence",
+    alias: "set-my-presence",
+    description: `Set the state of a user's presence session as an application. For more information about presence sessions, states permutations, and timeouts, see Manage presence state using the Microsoft Graph API.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "body",
+        description: `Action parameters`,
+        type: "Body",
+        schema: set_my_presence_Body
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "post",
+    path: "/me/presence/setStatusMessage",
+    alias: "set-my-status-message",
+    description: `Set a presence status message for a user. An optional expiration date and time can be supplied.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "body",
+        description: `Action parameters`,
+        type: "Body",
+        schema: set_my_status_message_Body
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "post",
+    path: "/me/presence/setUserPreferredPresence",
+    alias: "set-my-user-preferred-presence",
+    description: `Set the preferred availability and activity status for a user. If the preferred presence of a user is set, the user's presence shows as the preferred status. Preferred presence takes effect only when at least one presence session exists for the user. Otherwise, the user's presence shows as Offline. A presence session is created as a result of a successful setPresence operation, or if the user is signed in on a Microsoft Teams client. For more details, see presence sessions and time-out and expiration.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "body",
+        description: `Action parameters`,
+        type: "Body",
+        schema: set_my_user_preferred_presence_Body
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "post",
     path: "/me/sendMail",
     alias: "send-mail",
     description: `Send the message specified in the request body using either JSON or MIME format. When using JSON format, you can include a file attachment in the same sendMail action call. When using MIME format: This method saves the message in the Sent Items folder. Alternatively, create a draft message to send later. To learn more about the steps involved in the backend before a mail is delivered to recipients, see here.`,
@@ -10709,6 +11676,123 @@ resource.`,
         description: `Action parameters`,
         type: "Body",
         schema: send_mail_Body
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "get",
+    path: "/me/teamwork/associatedTeams",
+    alias: "list-my-associated-teams",
+    description: `Get the list of teams in Microsoft Teams that a user is associated with.
+Currently, a user can be associated with a team in two different ways:`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "$top",
+        type: "Query",
+        schema: z.number().int().gte(0).describe("Show only the first n items").optional()
+      },
+      {
+        name: "$skip",
+        type: "Query",
+        schema: z.number().int().gte(0).describe("Skip the first n items").optional()
+      },
+      {
+        name: "$search",
+        type: "Query",
+        schema: z.string().describe("Search items by search phrases").optional()
+      },
+      {
+        name: "$filter",
+        type: "Query",
+        schema: z.string().describe("Filter items by property values").optional()
+      },
+      {
+        name: "$count",
+        type: "Query",
+        schema: z.boolean().describe("Include count of items").optional()
+      },
+      {
+        name: "$orderby",
+        type: "Query",
+        schema: z.array(z.string()).describe("Order items by property values").optional()
+      },
+      {
+        name: "$select",
+        type: "Query",
+        schema: z.array(z.string()).describe("Select properties to be returned").optional()
+      },
+      {
+        name: "$expand",
+        type: "Query",
+        schema: z.array(z.string()).describe("Expand related entities").optional()
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "get",
+    path: "/me/teamwork/installedApps",
+    alias: "list-my-installed-teams-apps",
+    description: `The apps installed in the personal scope of this user.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "$top",
+        type: "Query",
+        schema: z.number().int().gte(0).describe("Show only the first n items").optional()
+      },
+      {
+        name: "$skip",
+        type: "Query",
+        schema: z.number().int().gte(0).describe("Skip the first n items").optional()
+      },
+      {
+        name: "$search",
+        type: "Query",
+        schema: z.string().describe("Search items by search phrases").optional()
+      },
+      {
+        name: "$filter",
+        type: "Query",
+        schema: z.string().describe("Filter items by property values").optional()
+      },
+      {
+        name: "$count",
+        type: "Query",
+        schema: z.boolean().describe("Include count of items").optional()
+      },
+      {
+        name: "$orderby",
+        type: "Query",
+        schema: z.array(z.string()).describe("Order items by property values").optional()
+      },
+      {
+        name: "$select",
+        type: "Query",
+        schema: z.array(z.string()).describe("Select properties to be returned").optional()
+      },
+      {
+        name: "$expand",
+        type: "Query",
+        schema: z.array(z.string()).describe("Expand related entities").optional()
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "post",
+    path: "/me/teamwork/sendActivityNotification",
+    alias: "send-my-activity-notification",
+    description: `Send an activity feed notification to a user. For more information, see sending Teams activity notifications.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "body",
+        description: `Action parameters`,
+        type: "Body",
+        schema: send_my_activity_notification_Body
       }
     ],
     response: z.void()
@@ -10759,6 +11843,53 @@ resource.`,
         name: "$expand",
         type: "Query",
         schema: z.array(z.string()).describe("Expand related entities").optional()
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "post",
+    path: "/me/todo/lists",
+    alias: "create-todo-task-list",
+    description: `Create a new lists object.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "body",
+        description: `New navigation property`,
+        type: "Body",
+        schema: microsoft_graph_todoTaskList
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "patch",
+    path: "/me/todo/lists/:todoTaskListId",
+    alias: "update-todo-task-list",
+    description: `Update the properties of a todoTaskList object.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "body",
+        description: `New navigation property values`,
+        type: "Body",
+        schema: microsoft_graph_todoTaskList
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "delete",
+    path: "/me/todo/lists/:todoTaskListId",
+    alias: "delete-todo-task-list",
+    description: `Deletes a todoTaskList object.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "If-Match",
+        type: "Header",
+        schema: z.string().describe("ETag").optional()
       }
     ],
     response: z.void()
@@ -12179,6 +13310,56 @@ To list them, include system in your $select statement.`,
   },
   {
     method: "get",
+    path: "/sites/:siteId/onenote/notebooks/:notebookId/sectionGroups",
+    alias: "list-sharepoint-site-onenote-notebook-section-groups",
+    description: `The section groups in the notebook. Read-only. Nullable.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "$top",
+        type: "Query",
+        schema: z.number().int().gte(0).describe("Show only the first n items").optional()
+      },
+      {
+        name: "$skip",
+        type: "Query",
+        schema: z.number().int().gte(0).describe("Skip the first n items").optional()
+      },
+      {
+        name: "$search",
+        type: "Query",
+        schema: z.string().describe("Search items by search phrases").optional()
+      },
+      {
+        name: "$filter",
+        type: "Query",
+        schema: z.string().describe("Filter items by property values").optional()
+      },
+      {
+        name: "$count",
+        type: "Query",
+        schema: z.boolean().describe("Include count of items").optional()
+      },
+      {
+        name: "$orderby",
+        type: "Query",
+        schema: z.array(z.string()).describe("Order items by property values").optional()
+      },
+      {
+        name: "$select",
+        type: "Query",
+        schema: z.array(z.string()).describe("Select properties to be returned").optional()
+      },
+      {
+        name: "$expand",
+        type: "Query",
+        schema: z.array(z.string()).describe("Expand related entities").optional()
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "get",
     path: "/sites/:siteId/onenote/notebooks/:notebookId/sections",
     alias: "list-sharepoint-site-onenote-notebook-sections",
     description: `The sections in the notebook. Read-only. Nullable.`,
@@ -12233,6 +13414,106 @@ To list them, include system in your $select statement.`,
     alias: "get-sharepoint-site-onenote-page-content",
     description: `The page's HTML content.`,
     requestFormat: "json",
+    response: z.void()
+  },
+  {
+    method: "get",
+    path: "/sites/:siteId/onenote/sectionGroups/:sectionGroupId/sectionGroups",
+    alias: "list-sharepoint-site-onenote-section-group-section-groups",
+    description: `The section groups in the section. Read-only. Nullable.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "$top",
+        type: "Query",
+        schema: z.number().int().gte(0).describe("Show only the first n items").optional()
+      },
+      {
+        name: "$skip",
+        type: "Query",
+        schema: z.number().int().gte(0).describe("Skip the first n items").optional()
+      },
+      {
+        name: "$search",
+        type: "Query",
+        schema: z.string().describe("Search items by search phrases").optional()
+      },
+      {
+        name: "$filter",
+        type: "Query",
+        schema: z.string().describe("Filter items by property values").optional()
+      },
+      {
+        name: "$count",
+        type: "Query",
+        schema: z.boolean().describe("Include count of items").optional()
+      },
+      {
+        name: "$orderby",
+        type: "Query",
+        schema: z.array(z.string()).describe("Order items by property values").optional()
+      },
+      {
+        name: "$select",
+        type: "Query",
+        schema: z.array(z.string()).describe("Select properties to be returned").optional()
+      },
+      {
+        name: "$expand",
+        type: "Query",
+        schema: z.array(z.string()).describe("Expand related entities").optional()
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "get",
+    path: "/sites/:siteId/onenote/sectionGroups/:sectionGroupId/sections",
+    alias: "list-sharepoint-site-onenote-section-group-sections",
+    description: `The sections in the section group. Read-only. Nullable.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "$top",
+        type: "Query",
+        schema: z.number().int().gte(0).describe("Show only the first n items").optional()
+      },
+      {
+        name: "$skip",
+        type: "Query",
+        schema: z.number().int().gte(0).describe("Skip the first n items").optional()
+      },
+      {
+        name: "$search",
+        type: "Query",
+        schema: z.string().describe("Search items by search phrases").optional()
+      },
+      {
+        name: "$filter",
+        type: "Query",
+        schema: z.string().describe("Filter items by property values").optional()
+      },
+      {
+        name: "$count",
+        type: "Query",
+        schema: z.boolean().describe("Include count of items").optional()
+      },
+      {
+        name: "$orderby",
+        type: "Query",
+        schema: z.array(z.string()).describe("Order items by property values").optional()
+      },
+      {
+        name: "$select",
+        type: "Query",
+        schema: z.array(z.string()).describe("Select properties to be returned").optional()
+      },
+      {
+        name: "$expand",
+        type: "Query",
+        schema: z.array(z.string()).describe("Expand related entities").optional()
+      }
+    ],
     response: z.void()
   },
   {
@@ -13492,6 +14773,66 @@ To monitor future changes, call the delta API by using the @odata.deltaLink in t
         name: "$expand",
         type: "Query",
         schema: z.array(z.string()).describe("Expand related entities").optional()
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "post",
+    path: "/users/:userId/messages/:messageId/forward",
+    alias: "forward-shared-mailbox-mail",
+    description: `Forward a message using either JSON or MIME format. When using JSON format, you can:
+- Specify either a comment or the body property of the message parameter. Specifying both will return an HTTP 400 Bad Request error.
+- Specify either the toRecipients parameter or the toRecipients property of the message parameter. Specifying both or specifying neither will return an HTTP 400 Bad Request error. When using MIME format:
+- Provide the applicable Internet message headers and the MIME content, all encoded in base64 format in the request body.
+- Add any attachments and S/MIME properties to the MIME content. This method saves the message in the Sent Items folder. Alternatively, create a draft to forward a message, and send it later.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "body",
+        description: `Action parameters`,
+        type: "Body",
+        schema: create_forward_draft_Body
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "post",
+    path: "/users/:userId/messages/:messageId/reply",
+    alias: "reply-shared-mailbox-mail",
+    description: `Reply to the sender of a message using either JSON or MIME format. When using JSON format:
+* Specify either a comment or the body property of the message parameter. Specifying both will return an HTTP 400 Bad Request error.
+* If the original message specifies a recipient in the replyTo property, per Internet Message Format (RFC 2822), send the reply to the recipients in replyTo and not the recipient in the from property. When using MIME format:
+- Provide the applicable Internet message headers and the MIME content, all encoded in base64 format in the request body.
+- Add any attachments and S/MIME properties to the MIME content. This method saves the message in the Sent Items folder. Alternatively, create a draft to reply to an existing message and send it later.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "body",
+        description: `Action parameters`,
+        type: "Body",
+        schema: create_reply_draft_Body
+      }
+    ],
+    response: z.void()
+  },
+  {
+    method: "post",
+    path: "/users/:userId/messages/:messageId/replyAll",
+    alias: "reply-all-shared-mailbox-mail",
+    description: `Reply to all recipients of a message using either JSON or MIME format. When using JSON format:
+- Specify either a comment or the body property of the message parameter. Specifying both will return an HTTP 400 Bad Request error.
+- If the original message specifies a recipient in the replyTo property, per Internet Message Format (RFC 2822), send the reply to the recipients in replyTo and not the recipient in the from property. When using MIME format:
+- Provide the applicable Internet message headers and the MIME content, all encoded in base64 format in the request body.
+- Add any attachments and S/MIME properties to the MIME content. This method saves the message in the Sent Items folder. Alternatively, create a draft to reply-all to a message and send it later.`,
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "body",
+        description: `Action parameters`,
+        type: "Body",
+        schema: create_reply_draft_Body
       }
     ],
     response: z.void()

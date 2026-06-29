@@ -7,7 +7,7 @@ function unwrapOptional(schema) {
   }
   return { inner: schema, optional: false };
 }
-function describeToolSchema(tool, llmTip) {
+function describeToolSchema(tool, llmTip, descriptionOverride) {
   const params = (tool.parameters ?? []).map((p) => {
     const { inner, optional } = unwrapOptional(p.schema);
     const isPath = p.type === "Path";
@@ -25,7 +25,7 @@ function describeToolSchema(tool, llmTip) {
     name: tool.alias,
     method: tool.method.toUpperCase(),
     path: tool.path,
-    description: tool.description ?? "",
+    description: descriptionOverride ?? tool.description ?? "",
     ...llmTip ? { llmTip } : {},
     parameters: params
   };

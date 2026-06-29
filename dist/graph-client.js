@@ -2,6 +2,11 @@ import logger from "./logger.js";
 import { encode as toonEncode } from "@toon-format/toon";
 import { getCloudEndpoints } from "./cloud-config.js";
 import { getRequestTokens } from "./request-context.js";
+import {
+  fetchWithResilience,
+  getSharedBreaker,
+  loadResilienceConfig
+} from "./lib/graph-resilience.js";
 function isBinaryContentType(contentType) {
   if (!contentType) return false;
   const lower = contentType.toLowerCase().split(";")[0].trim();
@@ -70,6 +75,8 @@ class GraphClient {
         const text = await response.text();
         if (text === "") {
           result = { message: "OK!" };
+        } else if (options.rawResponse) {
+          result = { message: "OK!", rawResponse: text };
         } else {
           try {
             result = JSON.parse(text);
@@ -95,19 +102,25 @@ class GraphClient {
   }
   async performRequest(endpoint, accessToken, options) {
     const cloudEndpoints = getCloudEndpoints(this.secrets.cloudType);
-    const url = `${cloudEndpoints.graphApi}/v1.0${endpoint}`;
+    const apiVersion = options.apiVersion || "v1.0";
+    const url = `${cloudEndpoints.graphApi}/${apiVersion}${endpoint}`;
     logger.info(`[GRAPH CLIENT] Final URL being sent to Microsoft: ${url}`);
     const headers = {
       Authorization: `Bearer ${accessToken}`,
       "Content-Type": "application/json",
       ...options.headers
     };
-    return fetch(url, {
-      method: options.method || "GET",
-      headers,
-      // Node's fetch accepts Buffer/Uint8Array; TS BodyInit doesn't.
-      body: options.body
-    });
+    return fetchWithResilience(
+      url,
+      {
+        method: options.method || "GET",
+        headers,
+        // Node's fetch accepts Buffer/Uint8Array; TS BodyInit doesn't.
+        body: options.body
+      },
+      loadResilienceConfig(),
+      getSharedBreaker()
+    );
   }
   serializeData(data, outputFormat, pretty = false) {
     if (outputFormat === "toon") {
@@ -167,7 +180,7 @@ class GraphClient {
       const removeODataProps2 = (obj) => {
         if (typeof obj === "object" && obj !== null) {
           Object.keys(obj).forEach((key) => {
-            if (key.startsWith("@odata.") && key !== "@odata.nextLink") {
+            if (key.startsWith("@odata.") && key !== "@odata.nextLink" && key !== "@odata.deltaLink") {
               delete obj[key];
             } else if (typeof obj[key] === "object") {
               removeODataProps2(obj[key]);
@@ -196,7 +209,7 @@ class GraphClient {
     const removeODataProps = (obj) => {
       if (typeof obj === "object" && obj !== null) {
         Object.keys(obj).forEach((key) => {
-          if (key.startsWith("@odata.") && key !== "@odata.nextLink") {
+          if (key.startsWith("@odata.") && key !== "@odata.nextLink" && key !== "@odata.deltaLink") {
             delete obj[key];
           } else if (typeof obj[key] === "object") {
             removeODataProps(obj[key]);

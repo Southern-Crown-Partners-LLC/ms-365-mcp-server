@@ -1,28 +1,19 @@
-import { PublicClientApplication } from "@azure/msal-node";
+import { AuthError, PublicClientApplication } from "@azure/msal-node";
 import logger from "./logger.js";
-import fs, { existsSync, readFileSync } from "fs";
+import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import path from "path";
 import { getSecrets } from "./secrets.js";
 import { getCloudEndpoints, getDefaultClientId } from "./cloud-config.js";
-let keytar = null;
-async function getKeytar() {
-  if (keytar === void 0) {
-    return null;
-  }
-  if (keytar === null) {
-    try {
-      const mod = await import("keytar");
-      keytar = mod.default ?? mod;
-      return keytar;
-    } catch (error) {
-      logger.info("keytar not available, using file-based credential storage");
-      keytar = void 0;
-      return null;
-    }
-  }
-  return keytar;
-}
+import {
+  createTokenCacheStorage,
+  DefaultTokenCacheStorage,
+  getSelectedAccountPath,
+  getTokenCachePath,
+  pickNewest,
+  unwrapCache,
+  wrapCache
+} from "./token-cache-storage.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const endpointsData = JSON.parse(
@@ -31,54 +22,42 @@ const endpointsData = JSON.parse(
 const endpoints = {
   default: endpointsData
 };
-const SERVICE_NAME = "ms-365-mcp-server";
-const TOKEN_CACHE_ACCOUNT = "msal-token-cache";
-const SELECTED_ACCOUNT_KEY = "selected-account";
-const FALLBACK_DIR = path.dirname(fileURLToPath(import.meta.url));
-const DEFAULT_TOKEN_CACHE_PATH = path.join(FALLBACK_DIR, "..", ".token-cache.json");
-const DEFAULT_SELECTED_ACCOUNT_PATH = path.join(FALLBACK_DIR, "..", ".selected-account.json");
-function getTokenCachePath() {
-  const envPath = process.env.MS365_MCP_TOKEN_CACHE_PATH?.trim();
-  return envPath || DEFAULT_TOKEN_CACHE_PATH;
-}
-function getSelectedAccountPath() {
-  const envPath = process.env.MS365_MCP_SELECTED_ACCOUNT_PATH?.trim();
-  return envPath || DEFAULT_SELECTED_ACCOUNT_PATH;
-}
-function ensureParentDir(filePath) {
-  const dir = path.dirname(filePath);
-  fs.mkdirSync(dir, { recursive: true, mode: 448 });
-}
-function wrapCache(data) {
-  return JSON.stringify({ _cacheEnvelope: true, data, savedAt: Date.now() });
-}
-function unwrapCache(raw) {
-  try {
-    const parsed = JSON.parse(raw);
-    if (parsed._cacheEnvelope && typeof parsed.data === "string") {
-      return { data: parsed.data, savedAt: parsed.savedAt };
-    }
-  } catch {
-  }
-  return { data: raw };
-}
-function pickNewest(keytarRaw, fileRaw) {
-  if (!keytarRaw && !fileRaw) return void 0;
-  if (keytarRaw && !fileRaw) return unwrapCache(keytarRaw).data;
-  if (!keytarRaw && fileRaw) return unwrapCache(fileRaw).data;
-  const kt = unwrapCache(keytarRaw);
-  const file = unwrapCache(fileRaw);
-  if (kt.savedAt === void 0 && file.savedAt === void 0) return kt.data;
-  if (kt.savedAt !== void 0 && file.savedAt === void 0) return kt.data;
-  if (kt.savedAt === void 0 && file.savedAt !== void 0) return file.data;
-  return kt.savedAt >= file.savedAt ? kt.data : file.data;
-}
 function createMsalConfig(secrets) {
   const cloudEndpoints = getCloudEndpoints(secrets.cloudType);
   return {
     auth: {
       clientId: secrets.clientId || getDefaultClientId(secrets.cloudType),
       authority: `${cloudEndpoints.authority}/${secrets.tenantId || "common"}`
+    }
+  };
+}
+function buildDiskCoherencyCachePlugin(storage) {
+  return {
+    beforeCacheAccess: async (context) => {
+      try {
+        const cacheRaw = await storage.load("token-cache");
+        if (cacheRaw) {
+          context.tokenCache.deserialize(unwrapCache(cacheRaw).data);
+        }
+      } catch (error) {
+        logger.error(`Error reloading token cache: ${error.message}`);
+        if (storage.failClosed) {
+          throw error;
+        }
+      }
+    },
+    afterCacheAccess: async (context) => {
+      if (!context.cacheHasChanged) {
+        return;
+      }
+      try {
+        await storage.save("token-cache", wrapCache(context.tokenCache.serialize()));
+      } catch (error) {
+        logger.error(`Error saving token cache: ${error.message}`);
+        if (storage.failClosed) {
+          throw error;
+        }
+      }
     }
   };
 }
@@ -89,6 +68,81 @@ const SCOPE_HIERARCHY = {
   "Tasks.ReadWrite": ["Tasks.Read"],
   "Contacts.ReadWrite": ["Contacts.Read"]
 };
+function parseAllowedScopes(value) {
+  if (value === void 0) {
+    return void 0;
+  }
+  return Array.from(new Set(value.trim().split(/\s+/).filter(Boolean)));
+}
+function getEndpointRequiredScopes(endpoint, includeWorkAccountScopes = false) {
+  if (!endpoint) {
+    return [];
+  }
+  const scopes = /* @__PURE__ */ new Set();
+  getEndpointScopeGroups(endpoint, includeWorkAccountScopes).forEach(
+    (group) => group.forEach((scope) => scopes.add(scope))
+  );
+  return Array.from(scopes);
+}
+function toScopeGroups(value) {
+  if (!value || value.length === 0) {
+    return [];
+  }
+  return Array.isArray(value[0]) ? value : [value];
+}
+function getEndpointScopeGroups(endpoint, includeWorkAccountScopes = false) {
+  if (!endpoint) {
+    return [];
+  }
+  const groups = [...toScopeGroups(endpoint.scopes)];
+  if (includeWorkAccountScopes) {
+    groups.push(...toScopeGroups(endpoint.workScopes));
+  }
+  return groups;
+}
+function getEndpointLoginScopes(endpoint, includeWorkAccountScopes = false) {
+  const groups = getEndpointScopeGroups(endpoint, includeWorkAccountScopes);
+  return groups.length > 0 ? groups[0] : [];
+}
+function getMissingAllowedScopesForGroups(scopeGroups, allowedScopes) {
+  if (allowedScopes === void 0 || scopeGroups.length === 0) {
+    return [];
+  }
+  const coveredAllowedScopes = new Set(collapseScopeHierarchy(allowedScopes));
+  let closest;
+  for (const group of scopeGroups) {
+    const missing = group.filter((scope) => !coveredAllowedScopes.has(scope));
+    if (missing.length === 0) {
+      return [];
+    }
+    if (!closest || missing.length < closest.length) {
+      closest = missing;
+    }
+  }
+  return closest ?? [];
+}
+function getEndpointEffectiveLoginScopes(scopeGroups, allowedScopes) {
+  if (scopeGroups.length === 0) {
+    return [];
+  }
+  if (allowedScopes === void 0) {
+    return scopeGroups[0];
+  }
+  const coveredAllowedScopes = new Set(collapseScopeHierarchy(allowedScopes));
+  const satisfied = scopeGroups.find(
+    (group) => group.every((scope) => coveredAllowedScopes.has(scope))
+  );
+  return satisfied ?? [];
+}
+function collapseRedundantScopes(scopes) {
+  const scopesSet = new Set(scopes);
+  Object.entries(SCOPE_HIERARCHY).forEach(([higherScope, lowerScopes]) => {
+    if (scopesSet.has(higherScope) && lowerScopes.every((scope) => scopesSet.has(scope))) {
+      lowerScopes.forEach((scope) => scopesSet.delete(scope));
+    }
+  });
+  return Array.from(scopesSet);
+}
 function buildScopesFromEndpoints(includeWorkAccountScopes = false, enabledToolsPattern, readOnly = false) {
   const scopesSet = /* @__PURE__ */ new Set();
   let enabledToolsRegex;
@@ -96,7 +150,7 @@ function buildScopesFromEndpoints(includeWorkAccountScopes = false, enabledTools
     try {
       enabledToolsRegex = new RegExp(enabledToolsPattern, "i");
       logger.info(`Building scopes with tool filter pattern: ${enabledToolsPattern}`);
-    } catch (error) {
+    } catch {
       logger.error(
         `Invalid tool filter regex pattern: ${enabledToolsPattern}. Building scopes without filter.`
       );
@@ -104,7 +158,9 @@ function buildScopesFromEndpoints(includeWorkAccountScopes = false, enabledTools
   }
   endpoints.default.forEach((endpoint) => {
     if (readOnly && endpoint.method.toUpperCase() !== "GET") {
-      return;
+      if (!(endpoint.method.toUpperCase() === "POST" && endpoint.readOnly)) {
+        return;
+      }
     }
     if (enabledToolsRegex && !enabledToolsRegex.test(endpoint.toolName)) {
       return;
@@ -112,34 +168,198 @@ function buildScopesFromEndpoints(includeWorkAccountScopes = false, enabledTools
     if (!includeWorkAccountScopes && !endpoint.scopes && endpoint.workScopes) {
       return;
     }
-    if (endpoint.scopes && Array.isArray(endpoint.scopes)) {
-      endpoint.scopes.forEach((scope) => scopesSet.add(scope));
-    }
-    if (includeWorkAccountScopes && endpoint.workScopes && Array.isArray(endpoint.workScopes)) {
-      endpoint.workScopes.forEach((scope) => scopesSet.add(scope));
-    }
+    getEndpointLoginScopes(endpoint, includeWorkAccountScopes).forEach(
+      (scope) => scopesSet.add(scope)
+    );
   });
-  Object.entries(SCOPE_HIERARCHY).forEach(([higherScope, lowerScopes]) => {
-    if (scopesSet.has(higherScope) && lowerScopes.every((scope) => scopesSet.has(scope))) {
-      lowerScopes.forEach((scope) => scopesSet.delete(scope));
-    }
-  });
-  const scopes = Array.from(scopesSet);
+  const scopes = collapseRedundantScopes(Array.from(scopesSet));
   if (enabledToolsPattern) {
     logger.info(`Built ${scopes.length} scopes for filtered tools: ${scopes.join(", ")}`);
   }
   return scopes;
 }
+function lowerScopesFor(scope) {
+  const lowerScopes = new Set(SCOPE_HIERARCHY[scope] ?? []);
+  if (scope.endsWith(".ReadWrite.All")) {
+    const readAllScope = scope.replace(/\.ReadWrite\.All$/, ".Read.All");
+    const readWriteScope = scope.replace(/\.ReadWrite\.All$/, ".ReadWrite");
+    const readScope = scope.replace(/\.ReadWrite\.All$/, ".Read");
+    lowerScopes.add(readAllScope);
+    lowerScopes.add(readWriteScope);
+    lowerScopes.add(readScope);
+  } else if (scope.endsWith(".ReadWrite.Shared")) {
+    lowerScopes.add(scope.replace(/\.ReadWrite\.Shared$/, ".Read.Shared"));
+  } else if (scope.endsWith(".ReadWrite")) {
+    lowerScopes.add(scope.replace(/\.ReadWrite$/, ".Read"));
+  } else if (scope.endsWith(".Read.All")) {
+    lowerScopes.add(scope.replace(/\.Read\.All$/, ".Read"));
+  }
+  return Array.from(lowerScopes);
+}
+function addImpliedScopes(scope, scopesSet) {
+  for (const lowerScope of lowerScopesFor(scope)) {
+    if (!scopesSet.has(lowerScope)) {
+      scopesSet.add(lowerScope);
+      addImpliedScopes(lowerScope, scopesSet);
+    }
+  }
+}
+function collapseScopeHierarchy(scopes) {
+  const scopesSet = new Set(scopes);
+  for (const scope of scopes) {
+    addImpliedScopes(scope, scopesSet);
+  }
+  return Array.from(scopesSet);
+}
+function getMissingAllowedScopes(requiredScopes, allowedScopes) {
+  if (allowedScopes === void 0) {
+    return [];
+  }
+  const coveredAllowedScopes = new Set(collapseScopeHierarchy(allowedScopes));
+  return requiredScopes.filter((scope) => !coveredAllowedScopes.has(scope));
+}
+function isScopeUsedByTools(allowedScope, toolScopes) {
+  const coveredByAllowedScope = new Set(collapseScopeHierarchy([allowedScope]));
+  return toolScopes.some((scope) => coveredByAllowedScope.has(scope));
+}
+function endpointMatchesNormalToolSurface(endpoint, includeWorkAccountScopes, enabledToolsRegex, readOnly = false) {
+  if (readOnly && endpoint.method.toUpperCase() !== "GET") {
+    if (!(endpoint.method.toUpperCase() === "POST" && endpoint.readOnly)) {
+      return false;
+    }
+  }
+  if (enabledToolsRegex && !enabledToolsRegex.test(endpoint.toolName)) {
+    return false;
+  }
+  if (!includeWorkAccountScopes && !endpoint.scopes && endpoint.workScopes) {
+    return false;
+  }
+  return true;
+}
+function buildAllowedScopeDiagnostics(options = {}) {
+  const allowedScopes = parseAllowedScopes(options.allowedScopes);
+  let enabledToolsRegex;
+  if (options.enabledTools) {
+    try {
+      enabledToolsRegex = new RegExp(options.enabledTools, "i");
+    } catch {
+      logger.error(
+        `Invalid tool filter regex pattern: ${options.enabledTools}. Building diagnostics without filter.`
+      );
+    }
+  }
+  const normalToolScopes = /* @__PURE__ */ new Set();
+  const effectiveToolScopes = /* @__PURE__ */ new Set();
+  const effectiveToolScopesAllGroups = /* @__PURE__ */ new Set();
+  const disabledTools = [];
+  for (const endpoint of endpoints.default) {
+    if (!endpointMatchesNormalToolSurface(
+      endpoint,
+      Boolean(options.orgMode),
+      enabledToolsRegex,
+      Boolean(options.readOnly)
+    )) {
+      continue;
+    }
+    const scopeGroups = getEndpointScopeGroups(endpoint, Boolean(options.orgMode));
+    const loginScopes = getEndpointLoginScopes(endpoint, Boolean(options.orgMode));
+    const allScopes = getEndpointRequiredScopes(endpoint, Boolean(options.orgMode));
+    loginScopes.forEach((scope) => normalToolScopes.add(scope));
+    const missingScopes = getMissingAllowedScopesForGroups(scopeGroups, allowedScopes);
+    if (missingScopes.length > 0) {
+      disabledTools.push({
+        toolName: endpoint.toolName,
+        requiredScopes: allScopes.sort((a, b) => a.localeCompare(b)),
+        missingScopes: missingScopes.sort((a, b) => a.localeCompare(b))
+      });
+      continue;
+    }
+    getEndpointEffectiveLoginScopes(scopeGroups, allowedScopes).forEach(
+      (scope) => effectiveToolScopes.add(scope)
+    );
+    allScopes.forEach((scope) => effectiveToolScopesAllGroups.add(scope));
+  }
+  const toolPermissions = collapseRedundantScopes(Array.from(normalToolScopes)).sort(
+    (a, b) => a.localeCompare(b)
+  );
+  const effectivePermissions = collapseRedundantScopes(Array.from(effectiveToolScopes)).sort(
+    (a, b) => a.localeCompare(b)
+  );
+  const sortedAllowedScopes = allowedScopes ? [...allowedScopes].sort((a, b) => a.localeCompare(b)) : void 0;
+  const missingAllowedScopesForTools = Array.from(
+    new Set(disabledTools.flatMap((tool) => tool.missingScopes))
+  ).sort((a, b) => a.localeCompare(b));
+  const allEffectiveToolScopes = Array.from(effectiveToolScopesAllGroups);
+  const extraAllowedScopesNotUsedByTools = sortedAllowedScopes?.filter((scope) => !isScopeUsedByTools(scope, allEffectiveToolScopes)) ?? [];
+  return {
+    permissions: effectivePermissions,
+    toolPermissions,
+    effectivePermissions,
+    ...sortedAllowedScopes ? { allowedScopes: sortedAllowedScopes } : {},
+    disabledTools,
+    missingAllowedScopesForTools,
+    extraAllowedScopesNotUsedByTools
+  };
+}
+function resolveAuthScopes(options = {}) {
+  const toolScopes = buildAllowedScopeDiagnostics(options).effectivePermissions;
+  const extraScopes = parseAllowedScopes(options.extraScopes);
+  if (!extraScopes || extraScopes.length === 0) {
+    return toolScopes;
+  }
+  return Array.from(/* @__PURE__ */ new Set([...toolScopes, ...extraScopes]));
+}
+function buildScopeDiagnostics(toolScopes, allowedScopesInput) {
+  const toolPermissions = [...toolScopes].sort((a, b) => a.localeCompare(b));
+  const coveredAllowedScopes = new Set(collapseScopeHierarchy(allowedScopesInput));
+  const missingAllowedScopesForTools = toolPermissions.filter(
+    (scope) => !coveredAllowedScopes.has(scope)
+  );
+  return {
+    permissions: toolPermissions.filter((scope) => coveredAllowedScopes.has(scope)),
+    toolPermissions,
+    effectivePermissions: toolPermissions.filter((scope) => coveredAllowedScopes.has(scope)),
+    allowedScopes: [...allowedScopesInput].sort((a, b) => a.localeCompare(b)),
+    disabledTools: [],
+    missingAllowedScopesForTools,
+    extraAllowedScopesNotUsedByTools: [...allowedScopesInput].sort((a, b) => a.localeCompare(b)).filter((scope) => !isScopeUsedByTools(scope, toolPermissions))
+  };
+}
+function describeAuthError(error) {
+  if (error instanceof AuthError) {
+    const suberror = error.subError ? ` / ${error.subError}` : "";
+    return `${error.errorCode}${suberror} (correlationId: ${error.correlationId || "none"}): ${error.errorMessage}`;
+  }
+  return error.message;
+}
+const MSA_HOME_TENANT_ID = "9188040d-6c67-4c5b-b112-36a304b66dad";
+function consumersAuthorityHint(error, account, authority) {
+  if (error instanceof AuthError && error.errorCode === "invalid_grant" && account?.tenantId === MSA_HOME_TENANT_ID && (!authority || /\/common\/?$/i.test(authority))) {
+    return `This looks like a known issue (June 2026) where Microsoft rejects refresh tokens issued to personal accounts via the default 'common' authority. If this server is used only with personal accounts, set MS365_MCP_TENANT_ID=consumers and re-login with: --login`;
+  }
+  return null;
+}
 class AuthManager {
-  constructor(config, scopes = buildScopesFromEndpoints()) {
+  constructor(config, scopes = [], expectedAccount, storage) {
     logger.info(`And scopes are ${scopes.join(", ")}`, scopes);
-    this.config = config;
     this.scopes = scopes;
+    this.storage = storage ?? new DefaultTokenCacheStorage();
+    this.config = {
+      ...config,
+      cache: {
+        ...config.cache,
+        cachePlugin: buildDiskCoherencyCachePlugin(this.storage)
+      }
+    };
     this.msalApp = new PublicClientApplication(this.config);
     this.accessToken = null;
     this.tokenExpiry = null;
     this.selectedAccountId = null;
     this.useInteractiveAuth = false;
+    this.expectedUsername = this.normalizeExpectedUsername(expectedAccount?.expectedUsername);
+    this.expectedHomeAccountId = this.normalizeExpectedHomeAccountId(
+      expectedAccount?.expectedHomeAccountId
+    );
     const oauthTokenFromEnv = process.env.MS365_MCP_OAUTH_TOKEN;
     this.oauthToken = oauthTokenFromEnv ?? null;
     this.isOAuthMode = oauthTokenFromEnv != null;
@@ -148,111 +368,166 @@ class AuthManager {
    * Creates an AuthManager instance with secrets loaded from the configured provider.
    * Uses Key Vault if MS365_MCP_KEYVAULT_URL is set, otherwise environment variables.
    */
-  static async create(scopes = buildScopesFromEndpoints()) {
+  static async create(scopes = [], expectedAccount, options = {}) {
     const secrets = await getSecrets();
     const config = createMsalConfig(secrets);
-    return new AuthManager(config, scopes);
+    const storage = options.storage ?? await createTokenCacheStorage({ allowCommandStorage: false, logProvider: true });
+    return new AuthManager(config, scopes, expectedAccount, storage);
   }
   async loadTokenCache() {
     try {
-      let keytarRaw;
-      try {
-        const kt = await getKeytar();
-        if (kt) {
-          keytarRaw = await kt.getPassword(SERVICE_NAME, TOKEN_CACHE_ACCOUNT) ?? void 0;
-        }
-      } catch (keytarError) {
-        logger.warn(`Keychain access failed: ${keytarError.message}`);
-      }
-      let fileRaw;
-      const cachePath = getTokenCachePath();
-      if (existsSync(cachePath)) {
-        fileRaw = readFileSync(cachePath, "utf8");
-      }
-      const cacheData = pickNewest(keytarRaw, fileRaw);
-      if (cacheData) {
-        this.msalApp.getTokenCache().deserialize(cacheData);
+      const cacheRaw = await this.storage.load("token-cache");
+      if (cacheRaw) {
+        this.msalApp.getTokenCache().deserialize(unwrapCache(cacheRaw).data);
       }
       await this.loadSelectedAccount();
     } catch (error) {
       logger.error(`Error loading token cache: ${error.message}`);
+      if (this.storage.failClosed) {
+        throw error;
+      }
     }
   }
   async loadSelectedAccount() {
     try {
-      let keytarRaw;
-      try {
-        const kt = await getKeytar();
-        if (kt) {
-          keytarRaw = await kt.getPassword(SERVICE_NAME, SELECTED_ACCOUNT_KEY) ?? void 0;
-        }
-      } catch (keytarError) {
-        logger.warn(
-          `Keychain access failed for selected account: ${keytarError.message}`
-        );
-      }
-      let fileRaw;
-      const accountPath = getSelectedAccountPath();
-      if (existsSync(accountPath)) {
-        fileRaw = readFileSync(accountPath, "utf8");
-      }
-      const selectedAccountData = pickNewest(keytarRaw, fileRaw);
-      if (selectedAccountData) {
-        const parsed = JSON.parse(selectedAccountData);
+      const selectedAccountRaw = await this.storage.load("selected-account");
+      if (selectedAccountRaw) {
+        const parsed = JSON.parse(unwrapCache(selectedAccountRaw).data);
         this.selectedAccountId = parsed.accountId;
         logger.info(`Loaded selected account: ${this.selectedAccountId}`);
       }
     } catch (error) {
       logger.error(`Error loading selected account: ${error.message}`);
-    }
-  }
-  async saveTokenCache() {
-    try {
-      const stamped = wrapCache(this.msalApp.getTokenCache().serialize());
-      try {
-        const kt = await getKeytar();
-        if (kt) {
-          await kt.setPassword(SERVICE_NAME, TOKEN_CACHE_ACCOUNT, stamped);
-        } else {
-          const cachePath = getTokenCachePath();
-          ensureParentDir(cachePath);
-          fs.writeFileSync(cachePath, stamped, { mode: 384 });
-        }
-      } catch (keytarError) {
-        logger.warn(
-          `Keychain save failed, falling back to file storage: ${keytarError.message}`
-        );
-        const cachePath = getTokenCachePath();
-        ensureParentDir(cachePath);
-        fs.writeFileSync(cachePath, stamped, { mode: 384 });
+      if (this.storage.failClosed) {
+        throw error;
       }
-    } catch (error) {
-      logger.error(`Error saving token cache: ${error.message}`);
     }
   }
   async saveSelectedAccount() {
     try {
       const stamped = wrapCache(JSON.stringify({ accountId: this.selectedAccountId }));
-      try {
-        const kt = await getKeytar();
-        if (kt) {
-          await kt.setPassword(SERVICE_NAME, SELECTED_ACCOUNT_KEY, stamped);
-        } else {
-          const accountPath = getSelectedAccountPath();
-          ensureParentDir(accountPath);
-          fs.writeFileSync(accountPath, stamped, { mode: 384 });
-        }
-      } catch (keytarError) {
-        logger.warn(
-          `Keychain save failed for selected account, falling back to file storage: ${keytarError.message}`
-        );
-        const accountPath = getSelectedAccountPath();
-        ensureParentDir(accountPath);
-        fs.writeFileSync(accountPath, stamped, { mode: 384 });
-      }
+      await this.storage.save("selected-account", stamped);
     } catch (error) {
       logger.error(`Error saving selected account: ${error.message}`);
+      if (this.storage.failClosed) {
+        throw error;
+      }
     }
+  }
+  normalizeExpectedUsername(value) {
+    if (value === void 0) {
+      return null;
+    }
+    const trimmed = value.trim();
+    if (trimmed === "") {
+      throw new Error("Expected Microsoft account username was provided but is empty.");
+    }
+    return trimmed.toLowerCase();
+  }
+  normalizeExpectedHomeAccountId(value) {
+    if (value === void 0) {
+      return null;
+    }
+    const trimmed = value.trim();
+    if (trimmed === "") {
+      throw new Error("Expected Microsoft account homeAccountId was provided but is empty.");
+    }
+    return trimmed;
+  }
+  hasExpectedAccount() {
+    return this.expectedUsername !== null || this.expectedHomeAccountId !== null;
+  }
+  expectedAccountLabel() {
+    const parts = [];
+    if (this.expectedUsername) {
+      parts.push(`username ${this.expectedUsername}`);
+    }
+    if (this.expectedHomeAccountId) {
+      parts.push(`homeAccountId ${this.expectedHomeAccountId}`);
+    }
+    return parts.join(" and ");
+  }
+  describeAccount(account) {
+    return account?.username || account?.name || "unknown";
+  }
+  describeCachedAccounts(accounts) {
+    if (accounts.length === 0) {
+      return "none";
+    }
+    return accounts.map((account) => this.describeAccount(account)).join(", ");
+  }
+  accountMatchesExpected(account) {
+    if (!this.hasExpectedAccount() || !account) {
+      return !this.hasExpectedAccount();
+    }
+    if (this.expectedUsername && account.username?.toLowerCase() !== this.expectedUsername) {
+      return false;
+    }
+    if (this.expectedHomeAccountId && account.homeAccountId !== this.expectedHomeAccountId) {
+      return false;
+    }
+    return true;
+  }
+  buildExpectedAccountMissingError(accounts) {
+    return new Error(
+      `Expected Microsoft account '${this.expectedAccountLabel()}' not found in token cache. Cached accounts: ${this.describeCachedAccounts(accounts)}. Run --login after configuring the expected account, or use --select-account to recover.`
+    );
+  }
+  resolveExpectedAccountFromAccounts(accounts) {
+    if (!this.hasExpectedAccount()) {
+      throw new Error("No expected Microsoft account is configured.");
+    }
+    const usernameMatch = this.expectedUsername ? accounts.find((account) => account.username?.toLowerCase() === this.expectedUsername) : void 0;
+    const homeAccountIdMatch = this.expectedHomeAccountId ? accounts.find((account) => account.homeAccountId === this.expectedHomeAccountId) : void 0;
+    if (this.expectedUsername && this.expectedHomeAccountId) {
+      if (!usernameMatch || !homeAccountIdMatch) {
+        throw this.buildExpectedAccountMissingError(accounts);
+      }
+      if (usernameMatch.homeAccountId !== homeAccountIdMatch.homeAccountId) {
+        throw new Error(
+          `Expected Microsoft account pins conflict: username ${this.expectedUsername} matched ${this.describeAccount(usernameMatch)}, but homeAccountId ${this.expectedHomeAccountId} matched ${this.describeAccount(homeAccountIdMatch)}.`
+        );
+      }
+      return usernameMatch;
+    }
+    const expectedAccount = usernameMatch ?? homeAccountIdMatch;
+    if (!expectedAccount) {
+      throw this.buildExpectedAccountMissingError(accounts);
+    }
+    return expectedAccount;
+  }
+  async assertExpectedAccountAvailable() {
+    if (!this.hasExpectedAccount()) {
+      return;
+    }
+    const accounts = await this.msalApp.getTokenCache().getAllAccounts();
+    this.resolveExpectedAccountFromAccounts(accounts);
+  }
+  async rejectUnexpectedLoginAccount(account) {
+    if (!this.hasExpectedAccount()) {
+      return;
+    }
+    if (this.accountMatchesExpected(account)) {
+      return;
+    }
+    this.accessToken = null;
+    this.tokenExpiry = null;
+    if (account) {
+      try {
+        await this.msalApp.getTokenCache().removeAccount(account);
+      } catch (error) {
+        logger.error(`Failed to remove unexpected account from cache: ${error.message}`);
+        throw new Error(
+          `Authenticated Microsoft account '${this.describeAccount(account)}' does not match expected Microsoft account '${this.expectedAccountLabel()}', and it could not be removed from the token cache (${error.message}). Its tokens may remain persisted - run --logout to clear the cache, then re-login.`
+        );
+      }
+      throw new Error(
+        `Authenticated Microsoft account '${this.describeAccount(account)}' does not match expected Microsoft account '${this.expectedAccountLabel()}'. Login was not persisted.`
+      );
+    }
+    throw new Error(
+      `Microsoft login did not return an account. Expected Microsoft account '${this.expectedAccountLabel()}'. Login was not persisted.`
+    );
   }
   async setOAuthToken(token) {
     this.oauthToken = token;
@@ -275,17 +550,24 @@ class AuthManager {
         const response = await this.msalApp.acquireTokenSilent(silentRequest);
         this.accessToken = response.accessToken;
         this.tokenExpiry = response.expiresOn ? new Date(response.expiresOn).getTime() : null;
-        await this.saveTokenCache();
         return this.accessToken;
-      } catch {
-        logger.error("Silent token acquisition failed");
-        throw new Error("Silent token acquisition failed");
+      } catch (error) {
+        const hint = consumersAuthorityHint(error, currentAccount, this.config.auth.authority);
+        logger.error(
+          `Silent token acquisition failed: ${describeAuthError(error)}${hint ? ` ${hint}` : ""}`
+        );
+        throw new Error(
+          hint ? `Silent token acquisition failed. ${hint}` : "Silent token acquisition failed"
+        );
       }
     }
     throw new Error("No valid token found");
   }
   async getCurrentAccount() {
     const accounts = await this.msalApp.getTokenCache().getAllAccounts();
+    if (this.hasExpectedAccount()) {
+      return this.resolveExpectedAccountFromAccounts(accounts);
+    }
     if (accounts.length === 0) {
       return null;
     }
@@ -323,12 +605,12 @@ class AuthManager {
       logger.info("Device code login successful");
       this.accessToken = response?.accessToken || null;
       this.tokenExpiry = response?.expiresOn ? new Date(response.expiresOn).getTime() : null;
+      await this.rejectUnexpectedLoginAccount(response?.account);
       if (!this.selectedAccountId && response?.account) {
         this.selectedAccountId = response.account.homeAccountId;
         await this.saveSelectedAccount();
         logger.info(`Auto-selected new account: ${response.account.username}`);
       }
-      await this.saveTokenCache();
       return this.accessToken;
     } catch (error) {
       logger.error(`Error in device code flow: ${error.message}`);
@@ -364,12 +646,12 @@ class AuthManager {
       logger.info("Interactive browser login successful");
       this.accessToken = response?.accessToken || null;
       this.tokenExpiry = response?.expiresOn ? new Date(response.expiresOn).getTime() : null;
+      await this.rejectUnexpectedLoginAccount(response?.account);
       if (!this.selectedAccountId && response?.account) {
         this.selectedAccountId = response.account.homeAccountId;
         await this.saveSelectedAccount();
         logger.info(`Auto-selected new account: ${response.account.username}`);
       }
-      await this.saveTokenCache();
       return this.accessToken;
     } catch (error) {
       logger.error(`Error in interactive browser flow: ${error.message}`);
@@ -439,23 +721,8 @@ class AuthManager {
       this.accessToken = null;
       this.tokenExpiry = null;
       this.selectedAccountId = null;
-      try {
-        const kt = await getKeytar();
-        if (kt) {
-          await kt.deletePassword(SERVICE_NAME, TOKEN_CACHE_ACCOUNT);
-          await kt.deletePassword(SERVICE_NAME, SELECTED_ACCOUNT_KEY);
-        }
-      } catch (keytarError) {
-        logger.warn(`Keychain deletion failed: ${keytarError.message}`);
-      }
-      const cachePath = getTokenCachePath();
-      if (fs.existsSync(cachePath)) {
-        fs.unlinkSync(cachePath);
-      }
-      const accountPath = getSelectedAccountPath();
-      if (fs.existsSync(accountPath)) {
-        fs.unlinkSync(accountPath);
-      }
+      await this.storage.delete("token-cache");
+      await this.storage.delete("selected-account");
       return true;
     } catch (error) {
       logger.error(`Error during logout: ${error.message}`);
@@ -468,6 +735,11 @@ class AuthManager {
   }
   async selectAccount(identifier) {
     const account = await this.resolveAccount(identifier);
+    if (this.hasExpectedAccount() && !this.accountMatchesExpected(account)) {
+      throw new Error(
+        `Account '${identifier}' does not match expected Microsoft account '${this.expectedAccountLabel()}'.`
+      );
+    }
     this.selectedAccountId = account.homeAccountId;
     await this.saveSelectedAccount();
     this.accessToken = null;
@@ -529,6 +801,9 @@ class AuthManager {
    * Used to decide whether to inject the `account` parameter into tool schemas.
    */
   async isMultiAccount() {
+    if (this.hasExpectedAccount()) {
+      return false;
+    }
     const accounts = await this.msalApp.getTokenCache().getAllAccounts();
     return accounts.length > 1;
   }
@@ -546,10 +821,26 @@ class AuthManager {
    */
   async getTokenForAccount(identifier) {
     if (this.isOAuthMode && this.oauthToken) {
+      if (identifier) {
+        throw new Error(
+          `Cannot switch to account '${identifier}': the server is in OAuth mode and always uses the identity of the supplied bearer token. Account switching requires stdio mode (or HTTP with --trust-proxy-auth).`
+        );
+      }
       return this.oauthToken;
     }
     let targetAccount = null;
-    if (identifier) {
+    if (this.hasExpectedAccount()) {
+      const accounts = await this.msalApp.getTokenCache().getAllAccounts();
+      targetAccount = this.resolveExpectedAccountFromAccounts(accounts);
+      if (identifier) {
+        const requestedAccount = await this.resolveAccount(identifier);
+        if (requestedAccount.homeAccountId !== targetAccount.homeAccountId) {
+          throw new Error(
+            `Account '${identifier}' does not match expected Microsoft account '${this.expectedAccountLabel()}'.`
+          );
+        }
+      }
+    } else if (identifier) {
       targetAccount = await this.resolveAccount(identifier);
     } else {
       const accounts = await this.msalApp.getTokenCache().getAllAccounts();
@@ -576,22 +867,37 @@ class AuthManager {
     };
     try {
       const response = await this.msalApp.acquireTokenSilent(silentRequest);
-      await this.saveTokenCache();
       return response.accessToken;
-    } catch {
+    } catch (error) {
+      const hint = consumersAuthorityHint(error, targetAccount, this.config.auth.authority);
+      logger.error(
+        `Silent token acquisition failed: ${describeAuthError(error)}${hint ? ` ${hint}` : ""}`
+      );
       throw new Error(
-        `Failed to acquire token for account '${targetAccount.username || targetAccount.name || "unknown"}'. The token may have expired. Please re-login with: --login`
+        `Failed to acquire token for account '${targetAccount.username || targetAccount.name || "unknown"}'. ` + (hint ?? "The token may have expired. Please re-login with: --login")
       );
     }
   }
 }
 var auth_default = AuthManager;
 export {
+  buildAllowedScopeDiagnostics,
+  buildDiskCoherencyCachePlugin,
+  buildScopeDiagnostics,
   buildScopesFromEndpoints,
+  collapseScopeHierarchy,
+  consumersAuthorityHint,
   auth_default as default,
+  describeAuthError,
+  getEndpointRequiredScopes,
+  getEndpointScopeGroups,
+  getMissingAllowedScopes,
+  getMissingAllowedScopesForGroups,
   getSelectedAccountPath,
   getTokenCachePath,
+  parseAllowedScopes,
   pickNewest,
+  resolveAuthScopes,
   unwrapCache,
   wrapCache
 };

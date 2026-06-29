@@ -1,61 +1,74 @@
-const TOOL_CATEGORIES = {
+import { readFileSync } from "fs";
+import { fileURLToPath } from "url";
+import path from "path";
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const endpointEntries = JSON.parse(
+  readFileSync(path.join(__dirname, "endpoints.json"), "utf8")
+);
+const PRESET_META = {
   mail: {
-    name: "mail",
-    pattern: /mail|attachment|draft|download-bytes/i,
     description: "Email operations (read, send, manage folders, attachments)"
   },
   calendar: {
-    name: "calendar",
-    pattern: /calendar|event|schedule|meeting/i,
     description: "Calendar and event management"
   },
   files: {
-    name: "files",
-    pattern: /drive|file|upload|download|folder|item/i,
     description: "OneDrive file and folder operations"
   },
   personal: {
-    name: "personal",
-    pattern: /mail|calendar|drive|contact|todo|onenote|attachment|draft|event|file|folder|search|query|download-bytes|parse-teams-url/i,
     description: "Personal productivity tools (mail, calendar, files, contacts, tasks, notes, search)"
   },
   work: {
-    name: "work",
-    pattern: /team|channel|chat|sharepoint|planner|site|list|shared|search|query|download-bytes|schedule|meeting/i,
     description: "Organization/work tools (Teams, SharePoint, shared mailboxes, search)",
     requiresOrgMode: true
   },
   excel: {
-    name: "excel",
-    pattern: /excel|worksheet|workbook|range|chart/i,
     description: "Excel spreadsheet operations"
   },
   contacts: {
-    name: "contacts",
-    pattern: /contact/i,
     description: "Outlook contacts management"
   },
   tasks: {
-    name: "tasks",
-    pattern: /todo|planner|task/i,
     description: "Task and planning tools (To Do, Planner)"
   },
   onenote: {
-    name: "onenote",
-    pattern: /onenote|notebook|section|page/i,
     description: "OneNote notebook operations"
   },
   search: {
-    name: "search",
-    pattern: /search|query/i,
     description: "Microsoft Search capabilities"
   },
   users: {
-    name: "users",
-    pattern: /user|list-users|download-bytes/i,
     description: "User directory access",
     requiresOrgMode: true
   },
+  outlook: {
+    description: "Outlook app only: mail, calendar and contacts"
+  },
+  onedrive: {
+    description: "OneDrive app only: drive and file operations, excluding Excel"
+  },
+  teams: {
+    description: "Teams app only: chats, channels, meetings and presence",
+    requiresOrgMode: true
+  }
+};
+function presetPattern(preset) {
+  const names = [
+    ...new Set(endpointEntries.filter((e) => e.presets?.includes(preset)).map((e) => e.toolName))
+  ];
+  if (names.length === 0) {
+    throw new Error(`Preset "${preset}" matches no endpoints in endpoints.json`);
+  }
+  return new RegExp(`^(?:${names.join("|")})$`);
+}
+const TOOL_CATEGORIES = {
+  ...Object.fromEntries(
+    Object.entries(PRESET_META).map(([name, meta]) => [
+      name,
+      { name, pattern: presetPattern(name), ...meta }
+    ])
+  ),
   all: {
     name: "all",
     pattern: /.*/,

@@ -1,9 +1,17 @@
 import logger from "../logger.js";
 import { getCloudEndpoints } from "../cloud-config.js";
-function buildWwwAuthenticate(req, error, description) {
+function buildResourceMetadataUrl(req, publicUrl) {
+  if (publicUrl) {
+    const parsed = new URL(publicUrl);
+    const path = parsed.pathname.replace(/\/$/, "");
+    return `${parsed.origin}/.well-known/oauth-protected-resource${path}`;
+  }
   const protocol = req.secure ? "https" : "http";
   const origin = `${protocol}://${req.get("host")}`;
-  const resourceMetadata = `${origin}/.well-known/oauth-protected-resource`;
+  return `${origin}/.well-known/oauth-protected-resource`;
+}
+function buildWwwAuthenticate(req, error, description, publicUrl) {
+  const resourceMetadata = buildResourceMetadataUrl(req, publicUrl);
   return `Bearer resource_metadata="${resourceMetadata}", error="${error}", error_description="${description}"`;
 }
 function isJwtExpired(token) {
@@ -17,12 +25,41 @@ function isJwtExpired(token) {
     return false;
   }
 }
-const microsoftBearerTokenAuthMiddleware = (req, res, next) => {
+const DISCOVERY_METHODS = /* @__PURE__ */ new Set([
+  "initialize",
+  "notifications/initialized",
+  "tools/list",
+  "prompts/list",
+  "resources/list",
+  "ping"
+]);
+function isDiscoveryRequest(req) {
+  if (req.method !== "POST" || !req.body) return false;
+  const body = req.body;
+  if (Array.isArray(body)) {
+    return body.every((item) => DISCOVERY_METHODS.has(item?.method));
+  }
+  return DISCOVERY_METHODS.has(body?.method);
+}
+const microsoftBearerTokenAuthMiddleware = (opts = {}) => (req, res, next) => {
+  if (opts.trustProxyAuth) {
+    next();
+    return;
+  }
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    if (opts.allowUnauthenticatedDiscovery && isDiscoveryRequest(req)) {
+      next();
+      return;
+    }
     res.status(401).set(
       "WWW-Authenticate",
-      buildWwwAuthenticate(req, "invalid_token", "Missing or malformed Authorization header")
+      buildWwwAuthenticate(
+        req,
+        "invalid_token",
+        "Missing or malformed Authorization header",
+        opts.publicUrl
+      )
     ).json({
       error: "invalid_token",
       error_description: "Missing or malformed Authorization header"
@@ -33,13 +70,50 @@ const microsoftBearerTokenAuthMiddleware = (req, res, next) => {
   if (isJwtExpired(accessToken)) {
     res.status(401).set(
       "WWW-Authenticate",
-      buildWwwAuthenticate(req, "invalid_token", "The access token has expired")
+      buildWwwAuthenticate(req, "invalid_token", "The access token has expired", opts.publicUrl)
     ).json({ error: "invalid_token", error_description: "The access token has expired" });
     return;
   }
   req.microsoftAuth = { accessToken };
   next();
 };
+class OAuthUpstreamError extends Error {
+  constructor(status, raw, body) {
+    const suffix = body.error_description ? ` - ${body.error_description}` : "";
+    super(`OAuth upstream error: ${body.error}${suffix}`);
+    this.name = "OAuthUpstreamError";
+    this.status = status;
+    this.body = body;
+    this.raw = raw;
+  }
+}
+function parseUpstreamOAuthError(raw) {
+  try {
+    const json = JSON.parse(raw);
+    if (json !== null && typeof json === "object" && typeof json.error === "string") {
+      return json;
+    }
+  } catch {
+  }
+  return null;
+}
+function toOAuthErrorResponse(error) {
+  if (error instanceof OAuthUpstreamError) {
+    const body = {
+      error: error.body.error
+    };
+    if (error.body.error_description) body.error_description = error.body.error_description;
+    if (error.body.suberror) body.suberror = error.body.suberror;
+    return { status: 400, body };
+  }
+  return {
+    status: 500,
+    body: {
+      error: "server_error",
+      error_description: "Internal server error during token exchange"
+    }
+  };
+}
 async function exchangeCodeForToken(code, redirectUri, clientId, clientSecret, tenantId = "common", codeVerifier, cloudType = "global") {
   const cloudEndpoints = getCloudEndpoints(cloudType);
   const params = new URLSearchParams({
@@ -62,9 +136,20 @@ async function exchangeCodeForToken(code, redirectUri, clientId, clientSecret, t
     body: params
   });
   if (!response.ok) {
-    const error = await response.text();
-    logger.error(`Failed to exchange code for token: ${error}`);
-    throw new Error(`Failed to exchange code for token: ${error}`);
+    const raw = await response.text();
+    const parsed = parseUpstreamOAuthError(raw);
+    if (parsed) {
+      logger.warn(`Token endpoint upstream OAuth error: ${parsed.error}`, {
+        status: response.status,
+        error: parsed.error,
+        suberror: parsed.suberror,
+        error_codes: parsed.error_codes,
+        correlation_id: parsed.correlation_id
+      });
+      throw new OAuthUpstreamError(response.status, raw, parsed);
+    }
+    logger.error(`Failed to exchange code for token: ${raw}`);
+    throw new Error(`Failed to exchange code for token: ${raw}`);
   }
   return response.json();
 }
@@ -86,14 +171,27 @@ async function refreshAccessToken(refreshToken, clientId, clientSecret, tenantId
     body: params
   });
   if (!response.ok) {
-    const error = await response.text();
-    logger.error(`Failed to refresh token: ${error}`);
-    throw new Error(`Failed to refresh token: ${error}`);
+    const raw = await response.text();
+    const parsed = parseUpstreamOAuthError(raw);
+    if (parsed) {
+      logger.warn(`Token endpoint upstream OAuth error: ${parsed.error}`, {
+        status: response.status,
+        error: parsed.error,
+        suberror: parsed.suberror,
+        error_codes: parsed.error_codes,
+        correlation_id: parsed.correlation_id
+      });
+      throw new OAuthUpstreamError(response.status, raw, parsed);
+    }
+    logger.error(`Failed to refresh token: ${raw}`);
+    throw new Error(`Failed to refresh token: ${raw}`);
   }
   return response.json();
 }
 export {
+  OAuthUpstreamError,
   exchangeCodeForToken,
   microsoftBearerTokenAuthMiddleware,
-  refreshAccessToken
+  refreshAccessToken,
+  toOAuthErrorResponse
 };

@@ -3,6 +3,14 @@ import path from "path";
 import { fileURLToPath } from "url";
 import fs from "fs";
 import os from "os";
+import { redactionEnabled, redactSensitive } from "./lib/log-redactor.js";
+const redactFormat = winston.format((info) => {
+  if (!redactionEnabled()) return info;
+  if (typeof info.message === "string") {
+    info.message = redactSensitive(info.message);
+  }
+  return info;
+});
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const logsDir = process.env.MS365_MCP_LOG_DIR || path.join(os.homedir(), ".ms-365-mcp-server", "logs");
 if (!fs.existsSync(logsDir)) {
@@ -29,6 +37,7 @@ ensureFileMode(serverLogPath);
 const logger = winston.createLogger({
   level: process.env.LOG_LEVEL || "info",
   format: winston.format.combine(
+    redactFormat(),
     winston.format.timestamp({
       format: "YYYY-MM-DD HH:mm:ss"
     }),
@@ -51,7 +60,11 @@ const logger = winston.createLogger({
 const enableConsoleLogging = () => {
   logger.add(
     new winston.transports.Console({
-      format: winston.format.combine(winston.format.colorize(), winston.format.simple()),
+      format: winston.format.combine(
+        redactFormat(),
+        winston.format.colorize(),
+        winston.format.simple()
+      ),
       silent: process.env.SILENT === "true" || process.env.SILENT === "1"
     })
   );

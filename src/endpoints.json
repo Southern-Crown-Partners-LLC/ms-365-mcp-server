@@ -974,6 +974,78 @@
     "workScopes": ["Notes.Read"]
   },
   {
+    "pathPattern": "/sites/{site-id}/onenote/notebooks",
+    "method": "post",
+    "toolName": "create-sharepoint-site-onenote-notebook",
+    "presets": ["onenote", "work"],
+    "workScopes": ["Notes.Create"]
+  },
+  {
+    "pathPattern": "/sites/{site-id}/onenote/notebooks/{notebook-id}/sections",
+    "method": "post",
+    "toolName": "create-sharepoint-site-onenote-section",
+    "presets": ["onenote", "work"],
+    "workScopes": ["Notes.Create"]
+  },
+  {
+    "pathPattern": "/sites/{site-id}/onenote/sectionGroups/{sectionGroup-id}/sections",
+    "method": "post",
+    "toolName": "create-sharepoint-site-onenote-section-group-section",
+    "presets": ["onenote", "work"],
+    "workScopes": ["Notes.Create"]
+  },
+  {
+    "pathPattern": "/sites/{site-id}/onenote/sections/{onenoteSection-id}/pages",
+    "method": "post",
+    "toolName": "create-sharepoint-site-onenote-section-page",
+    "presets": ["onenote", "work"],
+    "workScopes": ["Notes.Create"],
+    "contentType": "text/html",
+    "llmTip": "Body must be a full HTML document (with <html><head><title>...</title></head><body>...</body></html>). Partial HTML fails silently."
+  },
+  {
+    "pathPattern": "/sites/{site-id}/onenote/pages/{onenotePage-id}/content",
+    "method": "patch",
+    "toolName": "update-sharepoint-site-onenote-page-content",
+    "presets": ["onenote", "work"],
+    "workScopes": ["Notes.ReadWrite"],
+    "requestBodySchema": {
+      "type": "array",
+      "description": "Array of patchContentCommand objects applied in order to the page's HTML.",
+      "items": {
+        "type": "object",
+        "required": ["target", "action"],
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "Element to change: a data-id, the generated id, or a known name like 'body' or 'title'."
+          },
+          "action": {
+            "type": "string",
+            "enum": ["append", "insert", "prepend", "replace", "delete"],
+            "description": "What to do at the target. 'delete' takes no content."
+          },
+          "position": {
+            "type": "string",
+            "enum": ["after", "before"],
+            "description": "For 'insert'/'append', whether content goes after (default) or before the target's content."
+          },
+          "content": {
+            "type": "string",
+            "description": "HTML to add. Required for all actions except 'delete'."
+          }
+        }
+      }
+    }
+  },
+  {
+    "pathPattern": "/sites/{site-id}/onenote/pages/{onenotePage-id}",
+    "method": "delete",
+    "toolName": "delete-sharepoint-site-onenote-page",
+    "presets": ["onenote", "work"],
+    "workScopes": ["Notes.ReadWrite"]
+  },
+  {
     "pathPattern": "/me/onenote/pages",
     "method": "post",
     "toolName": "create-onenote-page",
@@ -1394,6 +1466,13 @@
     "workScopes": ["ChatMessage.Read"]
   },
   {
+    "pathPattern": "/chats/{chat-id}/messages/{chatMessage-id}",
+    "method": "patch",
+    "toolName": "update-chat-message",
+    "presets": ["teams", "work"],
+    "workScopes": ["Chat.ReadWrite"]
+  },
+  {
     "pathPattern": "/chats/{chat-id}/messages/{chatMessage-id}/hostedContents",
     "method": "get",
     "toolName": "list-chat-message-hosted-contents",
@@ -1407,7 +1486,7 @@
     "toolName": "send-chat-message",
     "presets": ["teams", "work"],
     "workScopes": ["ChatMessage.Send"],
-    "llmTip": "Use contentType 'html' in the body — plain text contentType gets mangled by Graph API."
+    "llmTip": "Use contentType 'html' in the body — plain text contentType gets mangled by Graph API. To @mention someone, put an <at id=\"0\">Name</at> tag in the html content and add a mentions array to the request body, as a sibling of the body property (not a separate top-level tool parameter): { body: { contentType: 'html', content: 'Hi <at id=\"0\">Name</at>' }, mentions: [{ id: 0, mentionText: 'Name', mentioned: { user: { id: '<aad-user-id>', displayName: 'Name', userIdentityType: 'aadUser' } } }] }. Each mention id must match its <at id> value; include userIdentityType: 'aadUser' or Graph returns 400 'value without a type name'."
   },
   {
     "pathPattern": "/me/joinedTeams",
@@ -1473,6 +1552,13 @@
     "workScopes": ["ChannelMessage.Read.All"]
   },
   {
+    "pathPattern": "/teams/{team-id}/channels/{channel-id}/messages/{chatMessage-id}",
+    "method": "patch",
+    "toolName": "update-channel-message",
+    "presets": ["teams", "work"],
+    "workScopes": ["ChannelMessage.ReadWrite"]
+  },
+  {
     "pathPattern": "/teams/{team-id}/channels/{channel-id}/messages/{chatMessage-id}/hostedContents",
     "method": "get",
     "toolName": "list-channel-message-hosted-contents",
@@ -1486,7 +1572,7 @@
     "toolName": "send-channel-message",
     "presets": ["teams", "work"],
     "workScopes": ["ChannelMessage.Send"],
-    "llmTip": "Use contentType 'html' in the body — plain text contentType gets mangled by Graph API."
+    "llmTip": "Use contentType 'html' in the body — plain text contentType gets mangled by Graph API. To @mention someone, put an <at id=\"0\">Name</at> tag in the html content and add a mentions array to the request body, as a sibling of the body property (not a separate top-level tool parameter): { body: { contentType: 'html', content: 'Hi <at id=\"0\">Name</at>' }, mentions: [{ id: 0, mentionText: 'Name', mentioned: { user: { id: '<aad-user-id>', displayName: 'Name', userIdentityType: 'aadUser' } } }] }. Each mention id must match its <at id> value; include userIdentityType: 'aadUser' or Graph returns 400 'value without a type name'."
   },
   {
     "pathPattern": "/teams/{team-id}/channels/{channel-id}/messages/{chatMessage-id}/replies",
@@ -1494,7 +1580,7 @@
     "toolName": "reply-to-channel-message",
     "presets": ["teams", "work"],
     "workScopes": ["ChannelMessage.Send"],
-    "llmTip": "Use contentType 'html' in the body — plain text contentType gets mangled by Graph API."
+    "llmTip": "Use contentType 'html' in the body — plain text contentType gets mangled by Graph API. To @mention someone, put an <at id=\"0\">Name</at> tag in the html content and add a mentions array to the request body, as a sibling of the body property (not a separate top-level tool parameter): { body: { contentType: 'html', content: 'Hi <at id=\"0\">Name</at>' }, mentions: [{ id: 0, mentionText: 'Name', mentioned: { user: { id: '<aad-user-id>', displayName: 'Name', userIdentityType: 'aadUser' } } }] }. Each mention id must match its <at id> value; include userIdentityType: 'aadUser' or Graph returns 400 'value without a type name'."
   },
   {
     "pathPattern": "/teams/{team-id}/channels/{channel-id}/messages/{chatMessage-id}/replies",
@@ -1502,6 +1588,13 @@
     "toolName": "list-channel-message-replies",
     "presets": ["teams", "work"],
     "workScopes": ["ChannelMessage.Read.All"]
+  },
+  {
+    "pathPattern": "/teams/{team-id}/channels/{channel-id}/messages/{chatMessage-id}/replies/{chatMessage-id1}",
+    "method": "patch",
+    "toolName": "update-channel-message-reply",
+    "presets": ["teams", "work"],
+    "workScopes": ["ChannelMessage.ReadWrite"]
   },
   {
     "pathPattern": "/teams/{team-id}/members",
@@ -1566,7 +1659,7 @@
     "toolName": "reply-to-chat-message",
     "presets": ["teams", "work"],
     "workScopes": ["ChatMessage.Send"],
-    "llmTip": "Use contentType 'html' in the body — plain text contentType gets mangled by Graph API."
+    "llmTip": "Use contentType 'html' in the body — plain text contentType gets mangled by Graph API. To @mention someone, put an <at id=\"0\">Name</at> tag in the html content and add a mentions array to the request body, as a sibling of the body property (not a separate top-level tool parameter): { body: { contentType: 'html', content: 'Hi <at id=\"0\">Name</at>' }, mentions: [{ id: 0, mentionText: 'Name', mentioned: { user: { id: '<aad-user-id>', displayName: 'Name', userIdentityType: 'aadUser' } } }] }. Each mention id must match its <at id> value; include userIdentityType: 'aadUser' or Graph returns 400 'value without a type name'."
   },
   {
     "pathPattern": "/chats/{chat-id}/messages/{chatMessage-id}/setReaction",
@@ -1766,6 +1859,7 @@
     "method": "post",
     "toolName": "search-query",
     "presets": ["personal", "search", "work"],
+    "readOnly": true,
     "workScopes": [
       "Mail.Read",
       "Calendars.Read",
@@ -1976,6 +2070,7 @@
     "method": "post",
     "toolName": "get-presences-by-user-id",
     "presets": ["teams", "work"],
+    "readOnly": true,
     "workScopes": ["Presence.Read.All"],
     "contentType": "application/json",
     "llmTip": "Gets presence for multiple users in a single call. Body: { ids: ['user-id-1', 'user-id-2', ...] }. Returns array of presence objects. More efficient than calling get-user-presence for each user. Maximum 650 user IDs per request."
@@ -2259,6 +2354,7 @@
     "method": "post",
     "toolName": "get-mail-tips",
     "presets": ["mail", "outlook", "personal"],
+    "readOnly": true,
     "scopes": ["Mail.Read"],
     "contentType": "application/json",
     "llmTip": "Looks up MailTips for one or more recipients before sending an email — answers 'is this person on auto-reply / OOF?', 'will my email exceed their mailbox quota?', 'are they an external recipient?', 'is this a mailbox or distribution list?'. Body: { EmailAddresses: ['user@contoso.com', ...], MailTipsOptions: 'automaticReplies, mailboxFullStatus, customMailTip, externalMemberCount, totalMemberCount, maxMessageSize, deliveryRestriction, moderationStatus, recipientScope, recipientSuggestions' (comma-separated subset) }. Returns mailTips per recipient with the requested fields populated. Use this to short-circuit urgent emails when a recipient is OOF, or to warn before fanning out to a large DL."
@@ -2429,6 +2525,7 @@
     "method": "post",
     "toolName": "get-onenote-notebook-from-web-url",
     "presets": ["onenote", "personal"],
+    "readOnly": true,
     "workScopes": ["Notes.Read"],
     "contentType": "application/json",
     "llmTip": "Resolves a OneNote notebook from its web URL (the link a user copies from OneNote / SharePoint / Teams). Body: { webUrl: 'https://...' }. Returns a notebook object with id, displayName, sectionsUrl, sectionGroupsUrl, and isShared — you can then list its sections via list-onenote-notebook-sections. Accepts user notebooks, group notebooks, and SharePoint-hosted team notebooks. Personal Microsoft accounts are not supported."

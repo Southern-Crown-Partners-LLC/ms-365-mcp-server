@@ -3,6 +3,7 @@ import { randomUUID } from 'crypto';
 import logger from './logger.js';
 import { auditLog, getUserIdentityForAudit } from './audit-log.js';
 import GraphClient from './graph-client.js';
+import { isDestructiveOperation } from './lib/destructive-ops.js';
 import AuthManager, {
   getEndpointScopeGroups,
   getMissingAllowedScopesForGroups,
@@ -130,6 +131,23 @@ function paginationAllowed(): boolean {
   const raw = process.env.MS365_MCP_ALLOW_PAGINATION;
   if (raw === undefined || raw === '') return true;
   return !/^(0|false|no)$/i.test(raw.trim());
+}
+
+// Canonical definition lives in lib/destructive-ops.ts so tool-schema.ts can
+// use it without circling back through graph-tools.ts; re-exported here for
+// external callers (tests, etc.) that imported it from this module.
+export { isDestructiveOperation };
+
+/**
+ * Defense-in-depth: destructive tools require an explicit `confirm: true` from
+ * the caller before they reach Microsoft Graph. Mitigates accidental
+ * sendMail / deleteEvent / etc. when an LLM misroutes a request or follows an
+ * injected instruction. Opt in per-deployment via MS365_MCP_REQUIRE_CONFIRM=true
+ * (default off, so the gate is a non-breaking, additive opt-in that can coexist
+ * with client-side elicitation prompts).
+ */
+function isConfirmGateEnabled(): boolean {
+  return process.env.MS365_MCP_REQUIRE_CONFIRM === 'true';
 }
 
 type TextContent = {
@@ -555,6 +573,9 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         }
         const response = await graphClient.graphRequest(itemPath, {
           accessToken: accountAccessToken,
+          // We JSON.parse the metadata below, so force JSON - under --toon it'd be
+          // TOON and the parse would fail, masking a real item as "no download url".
+          forceJsonOutput: true,
         });
         // graphRequest swallows Graph HTTP errors and returns { isError: true } (see
         // graph-client.ts); surface the real error (401/403/404/429/...) instead of masking
@@ -628,6 +649,60 @@ function registerUtilityToolWithMcp(
   );
 }
 
+// Dig out the object shape of a Body schema so flattened top-level params can be
+// matched against it (#569). z.lazy (chatMessage etc.) hides it behind _def.getter
+function bodySchemaShape(schema: z.ZodTypeAny | undefined): Record<string, unknown> | null {
+  let current: z.ZodTypeAny | undefined = schema;
+  for (let i = 0; i < 10 && current; i++) {
+    if (current instanceof z.ZodObject) {
+      return current.shape as Record<string, unknown>;
+    }
+    const def = (
+      current as {
+        _def?: { innerType?: z.ZodTypeAny; schema?: z.ZodTypeAny; getter?: () => z.ZodTypeAny };
+      }
+    )._def;
+    current = def?.innerType ?? def?.schema ?? def?.getter?.();
+  }
+  return null;
+}
+
+// SDK validation hands the handler the PARSED value, and strip-mode objects silently
+// drop unknown keys - passthrough keeps whatever the client sent
+function lenientBodySchema(schema: z.ZodTypeAny): z.ZodTypeAny {
+  if (schema instanceof z.ZodObject) {
+    return schema.passthrough();
+  }
+  if (schema instanceof z.ZodOptional) {
+    return lenientBodySchema(schema.unwrap()).optional();
+  }
+  if (schema instanceof z.ZodNullable) {
+    return lenientBodySchema(schema.unwrap()).nullable();
+  }
+  if (schema instanceof z.ZodLazy) {
+    return z.lazy(() => lenientBodySchema(schema.schema));
+  }
+  return schema;
+}
+
+// Read-only in Graph - merging an echoed id/timestamp into a POST/PATCH body can 400
+const READ_ONLY_BODY_FIELDS = new Set([
+  'id',
+  'createdDateTime',
+  'lastModifiedDateTime',
+  'changeKey',
+]);
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+// Object.hasOwn, but tsconfig targets ES2020. Not `in` - that would match
+// toString/constructor through the prototype
+function hasOwn(obj: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
 async function executeGraphTool(
   tool: (typeof api.endpoints)[0],
   config: EndpointConfig | undefined,
@@ -636,6 +711,32 @@ async function executeGraphTool(
   authManager?: AuthManager
 ): Promise<CallToolResult> {
   logger.info(`Tool ${tool.alias} called with params: ${JSON.stringify(params)}`);
+
+  if (
+    isConfirmGateEnabled() &&
+    isDestructiveOperation(tool.method, config) &&
+    params.confirm !== true
+  ) {
+    logger.warn(
+      `Refusing destructive tool ${tool.alias} (${tool.method.toUpperCase()}): missing confirm: true`
+    );
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            error: 'confirmation_required',
+            tool: tool.alias,
+            method: tool.method.toUpperCase(),
+            destructive: true,
+            message:
+              'This tool modifies user data. Re-call with parameter "confirm": true after the user has explicitly approved the operation.',
+          }),
+        },
+      ],
+      isError: true,
+    };
+  }
 
   const requestId = randomUUID();
   const startTime = Date.now();
@@ -682,11 +783,19 @@ async function executeGraphTool(
     const headers: Record<string, string> = {};
     let body: unknown = null;
 
+    // Body fields the client passed as top-level params (#569) - merged into the
+    // request body after the loop
+    const bodyShape = bodySchemaShape(
+      parameterDefinitions.find((p) => p.type === 'Body')?.schema as z.ZodTypeAny | undefined
+    );
+    const strayBodyFields: Record<string, unknown> = {};
+
     for (const [paramName, paramValue] of Object.entries(params)) {
       // Skip control parameters - not part of the Microsoft Graph API
       if (
         [
           'account',
+          'confirm',
           'fetchAllPages',
           'includeHeaders',
           'excludeResponse',
@@ -806,6 +915,44 @@ async function executeGraphTool(
         // list — forward it as a query param rather than silently dropping it.
         queryParams[fixedParamName] = `${paramValue}`;
         logger.info(`OData param fallback: forwarded ${fixedParamName}=${paramValue}`);
+      } else if (
+        bodyShape &&
+        (hasOwn(bodyShape, paramName) || hasOwn(bodyShape, camelCaseParamName)) &&
+        !READ_ONLY_BODY_FIELDS.has(hasOwn(bodyShape, paramName) ? paramName : camelCaseParamName)
+      ) {
+        // Client flattened the body object into top-level params - rescue instead of
+        // dropping. The read-only check uses the resolved name so kebab-case variants
+        // can't sneak past
+        const fieldName = hasOwn(bodyShape, paramName) ? paramName : camelCaseParamName;
+        strayBodyFields[fieldName] = paramValue;
+        logger.info(
+          `Body field fallback: merging top-level param '${fieldName}' into request body`
+        );
+      } else {
+        logger.warn(`Dropping unrecognized parameter '${paramName}' for tool ${tool.alias}`);
+      }
+    }
+
+    if (Object.keys(strayBodyFields).length > 0) {
+      if (isPlainObject(body)) {
+        // If none of body's keys are schema fields but the schema has a `body` field
+        // (message.body), the client meant it as that field - nest it. Spread order lets
+        // an explicit body win over stray duplicates in both branches
+        const keys = Object.keys(body);
+        const bodyIsNestedField =
+          bodyShape != null &&
+          hasOwn(bodyShape, 'body') &&
+          keys.length > 0 &&
+          keys.every((k) => !hasOwn(bodyShape, k));
+        body = bodyIsNestedField ? { ...strayBodyFields, body } : { ...strayBodyFields, ...body };
+        logger.info(`Merged flattened body fields: ${Object.keys(strayBodyFields).join(', ')}`);
+      } else if (body == null) {
+        body = strayBodyFields;
+        logger.info(`Merged flattened body fields: ${Object.keys(strayBodyFields).join(', ')}`);
+      } else {
+        logger.warn(
+          `Cannot merge flattened body fields (${Object.keys(strayBodyFields).join(', ')}) into non-object request body; dropping them`
+        );
       }
     }
 
@@ -874,6 +1021,7 @@ async function executeGraphTool(
       queryParams?: Record<string, string>;
       accessToken?: string;
       apiVersion?: string;
+      forceJsonOutput?: boolean;
     } = {
       method: tool.method.toUpperCase(),
       headers,
@@ -937,8 +1085,6 @@ async function executeGraphTool(
       `Making graph request to ${path} with options: ${JSON.stringify(safeOptions)}${_redacted ? ' [accessToken=REDACTED]' : ''}`
     );
 
-    let response = await graphClient.graphRequest(path, options);
-
     const fetchAllPages = params.fetchAllPages === true;
     const paginationEnabled = paginationAllowed();
     if (fetchAllPages && !paginationEnabled) {
@@ -946,75 +1092,104 @@ async function executeGraphTool(
         'fetchAllPages requested but MS365_MCP_ALLOW_PAGINATION is disabled; returning first page only'
       );
     }
-    if (fetchAllPages && paginationEnabled && response?.content?.[0]?.text) {
+    // Force every page to JSON so the merge loop can parse them. Under --toon they'd
+    // be TOON and JSON.parse would throw, silently returning only page one (#560).
+    // The merged result gets re-encoded once at the end.
+    const mergePages = fetchAllPages && paginationEnabled;
+    if (mergePages) {
+      options.forceJsonOutput = true;
+    }
+
+    let response = await graphClient.graphRequest(path, options);
+
+    if (mergePages && response?.content?.[0]?.text) {
+      type ODataPage = {
+        value?: unknown[];
+        '@odata.nextLink'?: string;
+        '@odata.deltaLink'?: string;
+        '@odata.count'?: number;
+        [key: string]: unknown;
+      };
+      let combinedResponse: ODataPage | undefined;
       try {
-        let combinedResponse = JSON.parse(response.content[0].text);
-        let allItems = combinedResponse.value || [];
-        let nextLink = combinedResponse['@odata.nextLink'];
-        let pageCount = 1;
-        const maxPages = positiveIntFromEnv('MS365_MCP_MAX_PAGES', DEFAULT_MAX_PAGES);
-        const maxItems = positiveIntFromEnv('MS365_MCP_MAX_ITEMS', DEFAULT_MAX_ITEMS);
-        // Graph only emits @odata.deltaLink on the final page of a /delta query.
-        // Track it across the pagination loop so we can stamp it on the combined
-        // response — otherwise fetchAllPages on a /delta endpoint silently drops
-        // the resume token and forces callers to re-list from scratch.
-        let deltaLink: string | undefined = combinedResponse['@odata.deltaLink'];
+        combinedResponse = JSON.parse(response.content[0].text) as ODataPage;
 
-        while (nextLink && pageCount < maxPages && allItems.length < maxItems) {
-          logger.info(`Fetching page ${pageCount + 1} from: ${nextLink}`);
+        // Only merge if page one is actually a collection. fetchAllPages can be set
+        // on a single-object GET too, and we'd otherwise graft a bogus value:[] on it.
+        const firstValue = combinedResponse.value;
+        if (Array.isArray(firstValue)) {
+          let allItems: unknown[] = firstValue;
+          let nextLink = combinedResponse['@odata.nextLink'];
+          let pageCount = 1;
+          const maxPages = positiveIntFromEnv('MS365_MCP_MAX_PAGES', DEFAULT_MAX_PAGES);
+          const maxItems = positiveIntFromEnv('MS365_MCP_MAX_ITEMS', DEFAULT_MAX_ITEMS);
+          // Graph only emits @odata.deltaLink on the final page of a /delta query.
+          // Track it across the pagination loop so we can stamp it on the combined
+          // response — otherwise fetchAllPages on a /delta endpoint silently drops
+          // the resume token and forces callers to re-list from scratch.
+          let deltaLink = combinedResponse['@odata.deltaLink'];
 
-          // Extract path + query string from the nextLink URL.
-          // Pass the full path (with query string) as the endpoint so that
-          // $skiptoken and other pagination params are preserved.
-          // Previously, query params were extracted into nextOptions.queryParams
-          // but graphRequest/performRequest never read that field — they were lost.
-          const url = new URL(nextLink);
-          // nextLink is absolute and version-qualified (/v1.0/... or /beta/...). Strip the
-          // version segment so performRequest can re-apply the request's own apiVersion.
-          const nextPath = url.pathname.replace(/^\/(v1\.0|beta)/, '') + url.search;
-          const nextOptions = { ...options };
+          while (nextLink && pageCount < maxPages && allItems.length < maxItems) {
+            logger.info(`Fetching page ${pageCount + 1} from: ${nextLink}`);
 
-          const nextResponse = await graphClient.graphRequest(nextPath, nextOptions);
-          if (nextResponse?.content?.[0]?.text) {
-            const nextJsonResponse = JSON.parse(nextResponse.content[0].text);
-            if (nextJsonResponse.value && Array.isArray(nextJsonResponse.value)) {
-              allItems = allItems.concat(nextJsonResponse.value);
+            // Extract path + query string from the nextLink URL.
+            // Pass the full path (with query string) as the endpoint so that
+            // $skiptoken and other pagination params are preserved.
+            // Previously, query params were extracted into nextOptions.queryParams
+            // but graphRequest/performRequest never read that field — they were lost.
+            const url = new URL(nextLink);
+            // nextLink is absolute and version-qualified (/v1.0/... or /beta/...). Strip the
+            // version segment so performRequest can re-apply the request's own apiVersion.
+            const nextPath = url.pathname.replace(/^\/(v1\.0|beta)/, '') + url.search;
+            const nextOptions = { ...options };
+
+            const nextResponse = await graphClient.graphRequest(nextPath, nextOptions);
+            if (nextResponse?.content?.[0]?.text) {
+              const nextJsonResponse = JSON.parse(nextResponse.content[0].text) as ODataPage;
+              if (Array.isArray(nextJsonResponse.value)) {
+                allItems = allItems.concat(nextJsonResponse.value);
+              }
+              nextLink = nextJsonResponse['@odata.nextLink'];
+              if (nextJsonResponse['@odata.deltaLink']) {
+                deltaLink = nextJsonResponse['@odata.deltaLink'];
+              }
+              pageCount++;
+            } else {
+              break;
             }
-            nextLink = nextJsonResponse['@odata.nextLink'];
-            if (nextJsonResponse['@odata.deltaLink']) {
-              deltaLink = nextJsonResponse['@odata.deltaLink'];
-            }
-            pageCount++;
-          } else {
-            break;
           }
-        }
 
-        if (pageCount >= maxPages) {
-          logger.warn(`Reached maximum page limit (${maxPages}) for pagination`);
-        }
-        if (allItems.length >= maxItems) {
-          logger.warn(
-            `Reached maximum item limit (${maxItems}) for pagination — truncated at ${allItems.length} items`
+          if (pageCount >= maxPages) {
+            logger.warn(`Reached maximum page limit (${maxPages}) for pagination`);
+          }
+          if (allItems.length >= maxItems) {
+            logger.warn(
+              `Reached maximum item limit (${maxItems}) for pagination — truncated at ${allItems.length} items`
+            );
+          }
+
+          combinedResponse.value = allItems;
+          if (combinedResponse['@odata.count']) {
+            combinedResponse['@odata.count'] = allItems.length;
+          }
+          delete combinedResponse['@odata.nextLink'];
+          if (deltaLink) {
+            combinedResponse['@odata.deltaLink'] = deltaLink;
+          }
+
+          logger.info(
+            `Pagination complete: collected ${allItems.length} items across ${pageCount} pages`
           );
         }
-
-        combinedResponse.value = allItems;
-        if (combinedResponse['@odata.count']) {
-          combinedResponse['@odata.count'] = allItems.length;
-        }
-        delete combinedResponse['@odata.nextLink'];
-        if (deltaLink) {
-          combinedResponse['@odata.deltaLink'] = deltaLink;
-        }
-
-        response.content[0].text = JSON.stringify(combinedResponse);
-
-        logger.info(
-          `Pagination complete: collected ${allItems.length} items across ${pageCount} pages`
-        );
       } catch (e) {
         logger.error(`Error during pagination: ${e}`);
+      }
+
+      // Re-encode once in the configured format. Runs whenever page one parsed
+      // (non-collection skip and mid-loop abort included), so a --toon client
+      // never gets handed the forced-JSON body.
+      if (combinedResponse !== undefined) {
+        response.content[0].text = graphClient.serialize(combinedResponse);
       }
     }
 
@@ -1153,7 +1328,11 @@ export function registerGraphTools(
     const paramSchema: Record<string, z.ZodTypeAny> = {};
     if (tool.parameters && tool.parameters.length > 0) {
       for (const param of tool.parameters) {
-        paramSchema[param.name] = param.schema || z.any();
+        // Lenient Body validation, or the SDK strips a flattened body value to {} (#569)
+        paramSchema[param.name] =
+          param.type === 'Body' && param.schema
+            ? lenientBodySchema(param.schema as z.ZodTypeAny)
+            : param.schema || z.any();
       }
     }
 
@@ -1275,6 +1454,22 @@ export function registerGraphTools(
       .describe('Exclude the full response body and only return success or failure indication')
       .optional();
 
+    // Destructive tools (POST except readOnly, PATCH, PUT, DELETE) require an
+    // explicit `confirm: true` server-side gate. See isDestructiveOperation +
+    // executeGraphTool for the enforcement; surface the param in the schema so
+    // the LLM/agent sees it upfront.
+    const destructive = isDestructiveOperation(tool.method, endpointConfig);
+    if (destructive) {
+      paramSchema['confirm'] = z
+        .boolean()
+        .describe(
+          'For destructive operations when the confirm gate is enabled (MS365_MCP_REQUIRE_CONFIRM=true; off by default). ' +
+            'Set to true only after the user has explicitly approved this action. ' +
+            'When the gate is on, calls without confirm: true return { error: "confirmation_required" } without touching user data.'
+        )
+        .optional();
+    }
+
     // Add timezone parameter for calendar endpoints that support it
     if (endpointConfig?.supportsTimezone) {
       paramSchema['timezone'] = z
@@ -1312,18 +1507,24 @@ export function registerGraphTools(
     const isReadOnlyTool = tool.method.toUpperCase() === 'GET' || endpointConfig?.readOnly === true;
 
     try {
-      server.tool(
+      // .passthrough() object, not a raw shape - the SDK wraps raw shapes in z.object()
+      // and strips unknown keys before the handler runs, which is exactly how #569's
+      // flattened subject/toRecipients got lost
+      server.registerTool(
         tool.alias,
-        toolDescription,
-        paramSchema,
         {
           title: tool.alias,
-          readOnlyHint: isReadOnlyTool,
-          destructiveHint:
-            !isReadOnlyTool && ['POST', 'PATCH', 'DELETE'].includes(tool.method.toUpperCase()),
-          openWorldHint: true, // All tools call Microsoft Graph API
+          description: toolDescription,
+          inputSchema: z.object(paramSchema).passthrough(),
+          annotations: {
+            title: tool.alias,
+            readOnlyHint: isReadOnlyTool,
+            destructiveHint: destructive,
+            openWorldHint: true, // All tools call Microsoft Graph API
+          },
         },
-        async (params) => executeGraphTool(tool, endpointConfig, graphClient, params, authManager)
+        async (params: Record<string, unknown>) =>
+          executeGraphTool(tool, endpointConfig, graphClient, params, authManager)
       );
       registeredCount++;
     } catch (error) {
@@ -1670,11 +1871,7 @@ export function registerDiscoveryTools(
     async ({ tool_name }) => {
       const entry = toolsRegistry.get(tool_name);
       if (entry) {
-        const schema = describeToolSchema(
-          entry.tool,
-          entry.config?.llmTip,
-          entry.config?.descriptionOverride
-        );
+        const schema = describeToolSchema(entry.tool, entry.config);
         return {
           content: [{ type: 'text', text: JSON.stringify(schema, null, 2) }],
         };

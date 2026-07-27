@@ -27,6 +27,7 @@ This server supports multiple Microsoft cloud environments:
 - Comprehensive Microsoft 365 service integration
 - Read-only mode support for safe operations
 - Tool filtering for granular access control
+- [Tool presets](#tool-presets) and [dynamic discovery](#dynamic-tool-discovery) to shrink the tool surface and token usage
 
 ## Output Format: JSON vs TOON
 
@@ -94,7 +95,7 @@ MS365_MCP_OUTPUT_FORMAT=toon npx @softeria/ms-365-mcp-server
 
 ## Supported Services & Tools
 
-The server provides 200+ tools covering most of the Microsoft Graph API surface. Each tool maps 1-to-1 to a Graph API endpoint and is defined declaratively in [`src/endpoints.json`](src/endpoints.json).
+The server provides 300+ tools covering most of the Microsoft Graph API surface. Each tool maps 1-to-1 to a Graph API endpoint and is defined declaratively in [`src/endpoints.json`](src/endpoints.json).
 
 ### Personal Account Tools (Available by default)
 
@@ -297,7 +298,7 @@ Open WebUI supports MCP servers via HTTP transport with OAuth 2.1.
 
 3. Click **Register Client**.
 
-> **Note**: Dynamic client registration is enabled by default in HTTP mode. Use `--no-dynamic-registration` to disable it. If using a custom Azure Entra app, the platform type for your redirect URI depends on whether the app has a client secret: with a secret use "Web", without one use "Mobile and desktop applications" (never "Single-page application").
+> **Note**: Dynamic client registration is enabled by default in HTTP mode. Use `--no-dynamic-registration` (or set `MS365_MCP_DISABLE_DCR=true`) to disable it. If using a custom Azure Entra app, the platform type for your redirect URI depends on whether the app has a client secret: with a secret use "Web", without one use "Mobile and desktop applications" (never "Single-page application").
 
 **Quick test setup** using the default Azure app (ID `ms-365` and `localhost:8080` are pre-configured):
 
@@ -509,7 +510,7 @@ Pinning is opt-in and local-MSAL only:
 
 ## Tool Presets
 
-To reduce initial connection overhead, use preset tool categories instead of loading all 90+ tools:
+To reduce initial connection overhead and token usage, use preset tool categories instead of loading the full tool set:
 
 ```bash
 npx @softeria/ms-365-mcp-server --preset mail
@@ -518,7 +519,7 @@ npx @softeria/ms-365-mcp-server --list-presets  # See all available presets
 
 Available presets: `mail`, `calendar`, `files`, `personal`, `work`, `excel`, `contacts`, `tasks`, `onenote`, `search`, `users`, `outlook`, `onedrive`, `teams`, `all`
 
-Each endpoint in `endpoints.json` declares which presets it belongs to via a `presets` array, so every preset is an exact tool-name allow-list that never over-matches across apps (e.g. `mail` does not include shared-mailbox tools; those are in `work`).
+Each endpoint in `endpoints.json` declares which presets it belongs to via a `presets` array, so every preset is an exact tool-name allow-list that never over-matches across apps (e.g. `mail` does not include shared-mailbox tools; those are in `work`). The universal binary reader `download-bytes` is included in every preset, so whatever an app returns (a file, an attachment, a photo, a recording) can always be fetched; `get-download-url` (a pre-authenticated URL for drive/SharePoint files) rides with the drive-backed presets. So a preset that can find a file can always read its bytes.
 
 The `outlook`, `onedrive` and `teams` presets are app-scoped: they expose exactly one Microsoft app. Use these for "expose exactly one app" deployments:
 
@@ -532,7 +533,7 @@ npx @softeria/ms-365-mcp-server --org-mode --preset teams
 
 ## Dynamic Tool Discovery
 
-Instead of loading all 90+ tools upfront, use dynamic discovery so the LLM finds and loads tools only when it needs them:
+Instead of loading every tool upfront, use dynamic discovery so the LLM finds and loads tools only when it needs them:
 
 ```bash
 npx @softeria/ms-365-mcp-server --discovery
@@ -595,7 +596,7 @@ Environment variables:
 - `MS365_MCP_CLOUD_TYPE=global|china`: Microsoft cloud environment (alternative to --cloud flag)
 - `LOG_LEVEL`: Set logging level (default: 'info')
 - `SILENT=true|1`: Disable console output
-- `MS365_MCP_REDACT_PII=true|1`: Scrub JWTs, Bearer headers, OAuth token fields, and email addresses from log messages before they are written (default: disabled). Useful when logs are shipped to a central store or shared host.
+- `MS365_MCP_REDACT_PII=false|0`: Disable scrubbing of JWTs, Bearer headers, OAuth token fields, and email addresses from log messages (default: enabled). The server handles live Graph bearer tokens, so redaction is on unless you opt out for fully verbose local debugging.
 - `MS365_MCP_CLIENT_ID`: Custom Azure app client ID (defaults to built-in app)
 - `MS365_MCP_TENANT_ID`: Custom tenant ID (defaults to 'common' for multi-tenant). **Personal Microsoft accounts should set this to `consumers`** - as of June 2026, refresh tokens issued via the default 'common' authority are rejected at the first refresh, so sessions die roughly an hour after login
 - `MS365_MCP_OAUTH_TOKEN`: Pre-existing OAuth token for Microsoft Graph API (BYOT method)

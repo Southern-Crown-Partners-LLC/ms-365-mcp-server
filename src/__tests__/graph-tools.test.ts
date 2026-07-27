@@ -1,5 +1,8 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { z } from 'zod';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 
 /**
  * We test executeGraphTool logic by importing it indirectly through registerGraphTools.
@@ -61,6 +64,7 @@ function makeEndpoint(overrides: Partial<any> = {}) {
       { name: 'search', type: 'Query', schema: z.string().optional() },
       { name: 'select', type: 'Query', schema: z.string().optional() },
       { name: 'orderby', type: 'Query', schema: z.string().optional() },
+      { name: 'expand', type: 'Query', schema: z.string().optional() },
       { name: 'count', type: 'Query', schema: z.boolean().optional() },
       { name: 'top', type: 'Query', schema: z.number().optional() },
       { name: 'skip', type: 'Query', schema: z.number().optional() },
@@ -81,7 +85,7 @@ function makeConfig(overrides: Partial<any> = {}) {
 }
 
 /** Creates a mock GraphClient with a controllable graphRequest spy */
-function createMockGraphClient(responses?: any[]) {
+function createMockGraphClient(responses?: any[], outputFormat: 'json' | 'toon' = 'json') {
   const responseQueue = [...(responses || [])];
   return {
     graphRequest: vi.fn().mockImplementation(async () => {
@@ -92,6 +96,13 @@ function createMockGraphClient(responses?: any[]) {
         content: [{ type: 'text', text: JSON.stringify({ value: [] }) }],
       };
     }),
+    // Fake serialize: prefix the JSON in toon mode so a test can tell the merged
+    // body went through serialize() and not a plain JSON.stringify.
+    serialize: vi
+      .fn()
+      .mockImplementation((data: unknown) =>
+        outputFormat === 'toon' ? `TOON:${JSON.stringify(data)}` : JSON.stringify(data)
+      ),
   };
 }
 
@@ -122,6 +133,20 @@ function createMockServer() {
         handler: (...args: any[]) => any
       ) => {
         tools.set(name, { description, schema, handler });
+      }
+    ),
+    registerTool: vi.fn(
+      (
+        name: string,
+        config: { description: string; inputSchema: any },
+        handler: (...args: any[]) => any
+      ) => {
+        // Expose the zod object's shape so tests can keep asserting on params
+        tools.set(name, {
+          description: config.description,
+          schema: config.inputSchema?.shape ?? config.inputSchema,
+          handler,
+        });
       }
     ),
     tools,
@@ -219,6 +244,79 @@ describe('graph-tools', () => {
       expect(parsed.value.map((v: any) => v.id)).toEqual(['1', '2', '3']);
       // nextLink should be removed from final response
       expect(parsed['@odata.nextLink']).toBeUndefined();
+    });
+
+    it('merges all pages under --toon and encodes the combined result once (#560)', async () => {
+      const endpoint = makeEndpoint();
+      const config = makeConfig();
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      // Pages are JSON here to mimic the forceJsonOutput path; the mock's serialize
+      // adds the TOON prefix so we can check the merged result was re-encoded (#560).
+      const graphClient = createMockGraphClient(
+        [
+          {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  value: [{ id: '1' }, { id: '2' }],
+                  '@odata.nextLink': 'https://graph.microsoft.com/v1.0/me/messages?$skip=2',
+                }),
+              },
+            ],
+          },
+          {
+            content: [{ type: 'text', text: JSON.stringify({ value: [{ id: '3' }] }) }],
+          },
+        ],
+        'toon'
+      );
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('test-tool');
+      const result = await tool!.handler({ fetchAllPages: true });
+
+      // Both page requests must be forced to JSON so the merge can parse them.
+      for (const call of graphClient.graphRequest.mock.calls) {
+        expect(call[1]?.forceJsonOutput).toBe(true);
+      }
+
+      // Final body is encoded once via serialize() in the configured (toon) format,
+      // not re-parsed as JSON. It must still contain all 3 merged items.
+      expect(graphClient.serialize).toHaveBeenCalledTimes(1);
+      expect(result.content[0].text.startsWith('TOON:')).toBe(true);
+      const parsed = JSON.parse(result.content[0].text.slice('TOON:'.length));
+      expect(parsed.value.map((v: any) => v.id)).toEqual(['1', '2', '3']);
+      expect(parsed['@odata.nextLink']).toBeUndefined();
+    });
+
+    it('does not inject value:[] when fetchAllPages hits a single-object (non-collection) GET', async () => {
+      const endpoint = makeEndpoint();
+      const config = makeConfig();
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      // Single-object response (no `value`). fetchAllPages can be set on any GET,
+      // and the merge must leave the object alone, not graft on an empty value array.
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify({ id: 'abc', displayName: 'Solo' }) }] },
+      ]);
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const result = await server.tools.get('test-tool')!.handler({ fetchAllPages: true });
+      const parsed = JSON.parse(result.content[0].text);
+
+      expect(parsed).toEqual({ id: 'abc', displayName: 'Solo' });
+      expect(parsed.value).toBeUndefined();
+      expect(graphClient.graphRequest).toHaveBeenCalledTimes(1);
     });
 
     it('should stop at 100 page limit', async () => {
@@ -414,6 +512,44 @@ describe('graph-tools', () => {
 
       expect(schema['top'].description).toContain('Start small');
       expect(schema['top'].description).toContain('$select');
+    });
+    it('should describe $expand as navigation-properties-only', async () => {
+      const endpoint = makeEndpoint();
+      const config = makeConfig();
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, createMockGraphClient() as any);
+
+      const schema = server.tools.get('test-tool')!.schema;
+
+      expect(schema['expand']).toBeDefined();
+      // Must not be Microsoft's uninformative "Expand related entities".
+      expect(schema['expand'].description).not.toBe('Expand related entities');
+      expect(schema['expand'].description).toContain('navigation');
+      // Names at least one real navigation property so the model has something to copy.
+      expect(schema['expand'].description).toContain('attachments');
+    });
+
+    // graph-tools synthesizes path params only for endpoints where the generated
+    // client (via hack.ts) has not already supplied one — mostly function-style paths.
+    it('should describe path params it synthesizes itself', async () => {
+      const endpoint = makeEndpoint({ path: '/me/messages/:messageId' });
+      const config = makeConfig();
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, createMockGraphClient() as any);
+
+      const schema = server.tools.get('test-tool')!.schema;
+
+      expect(schema['messageId']).toBeDefined();
+      expect(schema['messageId'].description).not.toBe('Path parameter: messageId');
+      expect(schema['messageId'].description).toContain("not as 'id'");
     });
   });
 
@@ -699,6 +835,7 @@ describe('graph-tools', () => {
       await server.tools.get('create-reply-draft')!.handler({
         messageId: 'AAMk123',
         body: { Message: { body: { contentType: 'html', content: '<p>hi</p>' } } },
+        confirm: true, // destructive POST — required by isDestructiveOperation gate
       });
 
       const [, options] = graphClient.graphRequest.mock.calls[0];
@@ -747,6 +884,7 @@ describe('graph-tools', () => {
         driveId: 'drive123',
         driveItemId: 'item456',
         body: base64,
+        confirm: true, // destructive PUT — required by isDestructiveOperation gate
       });
 
       const [path, options] = graphClient.graphRequest.mock.calls[0];
@@ -788,6 +926,7 @@ describe('graph-tools', () => {
         driveId: 'd',
         driveItemId: 'i',
         body: Buffer.from('%PDF-1.4').toString('base64'),
+        confirm: true, // destructive PUT — required by isDestructiveOperation gate
       });
 
       const [, options] = graphClient.graphRequest.mock.calls[0];
@@ -866,6 +1005,212 @@ describe('graph-tools', () => {
     });
   });
 
+  // ---- 9a. download-bytes-to-file utility tool ----
+  describe('download-bytes-to-file', () => {
+    let tmpDir: string;
+
+    beforeEach(() => {
+      tmpDir = mkdtempSync(join(tmpdir(), 'dbtf-'));
+    });
+
+    afterEach(() => {
+      rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it('streams bytes to the output path and returns metadata', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      // downloadToFile is mocked here; binary-response.test.ts covers the real
+      // streaming + write. This just checks the tool wires the call and maps it.
+      const graphClient = {
+        downloadToFile: vi.fn().mockResolvedValue({
+          contentType: 'image/jpeg',
+          contentLength: 2,
+        }),
+      };
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('download-bytes-to-file');
+      expect(tool).toBeDefined();
+
+      const outputPath = join(tmpDir, 'photo.jpg');
+      const result = await tool!.handler({ target: '/me/photo/$value', outputPath });
+
+      expect(graphClient.downloadToFile).toHaveBeenCalledTimes(1);
+      const [reqPath, dest, options] = graphClient.downloadToFile.mock.calls[0];
+      expect(reqPath).toBe('/me/photo/$value');
+      expect(dest).toBe(outputPath);
+      expect(options).toStrictEqual({ accessToken: undefined });
+
+      expect(result.isError).toBeUndefined();
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload).toEqual({ path: outputPath, contentType: 'image/jpeg', bytesWritten: 2 });
+    });
+
+    it('rejects a relative outputPath', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const graphClient = { downloadToFile: vi.fn() };
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const result = await server.tools
+        .get('download-bytes-to-file')!
+        .handler({ target: '/me/photo/$value', outputPath: 'relative/path.jpg' });
+
+      expect(result.isError).toBe(true);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toMatch(/absolute path/);
+      expect(graphClient.downloadToFile).not.toHaveBeenCalled();
+    });
+
+    it('rejects absolute URLs in target (Graph paths only)', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, {} as any);
+
+      const result = await server.tools.get('download-bytes-to-file')!.handler({
+        target: 'https://example.sharepoint.com/d/abc?temp=signed',
+        outputPath: join(tmpDir, 'x.bin'),
+      });
+
+      expect(result.isError).toBe(true);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toMatch(/relative Microsoft Graph path/);
+    });
+
+    it('refuses to overwrite an existing file and skips the Graph call', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const outputPath = join(tmpDir, 'existing.bin');
+      writeFileSync(outputPath, 'original');
+
+      const graphClient = { downloadToFile: vi.fn() };
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const result = await server.tools
+        .get('download-bytes-to-file')!
+        .handler({ target: '/me/photo/$value', outputPath });
+
+      expect(result.isError).toBe(true);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toMatch(/already exists/);
+      expect(graphClient.downloadToFile).not.toHaveBeenCalled();
+      // Original file is untouched.
+      expect(readFileSync(outputPath).toString('utf8')).toBe('original');
+    });
+
+    it('surfaces a Graph error when downloadToFile throws', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      // downloadToFile throws on Graph HTTP errors and cleans up any partial file
+      // itself; here we just check the tool surfaces the error.
+      const graphClient = {
+        downloadToFile: vi
+          .fn()
+          .mockRejectedValue(new Error('Microsoft Graph API error: 404 Not Found')),
+      };
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const outputPath = join(tmpDir, 'missing.bin');
+      const result = await server.tools
+        .get('download-bytes-to-file')!
+        .handler({ target: '/me/messages/abc/attachments/xyz/$value', outputPath });
+
+      expect(result.isError).toBe(true);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toMatch(/404 Not Found/);
+    });
+
+    it('forwards the resolved account token to downloadToFile in multi-account mode', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const graphClient = {
+        downloadToFile: vi
+          .fn()
+          .mockResolvedValue({ contentType: 'application/pdf', contentLength: 3 }),
+      };
+      const authManager = {
+        isOAuthModeEnabled: vi.fn().mockReturnValue(false),
+        getToken: vi.fn().mockResolvedValue(null),
+        getTokenForAccount: vi.fn().mockResolvedValue('account-2-token'),
+      };
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(
+        server as any,
+        graphClient as any,
+        false,
+        undefined,
+        false,
+        authManager as any,
+        true,
+        ['user1@domain.com', 'user2@domain.com']
+      );
+
+      const outputPath = join(tmpDir, 'invoice.pdf');
+      const result = await server.tools.get('download-bytes-to-file')!.handler({
+        target: '/me/messages/m1/attachments/a1/$value',
+        outputPath,
+        account: 'user2@domain.com',
+      });
+
+      expect(result.isError).toBeUndefined();
+      expect(authManager.getTokenForAccount).toHaveBeenCalledWith('user2@domain.com');
+      expect(graphClient.downloadToFile).toHaveBeenCalledWith(
+        '/me/messages/m1/attachments/a1/$value',
+        outputPath,
+        { accessToken: 'account-2-token' }
+      );
+    });
+
+    it('is registered in stdio mode but hidden in HTTP mode', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const { registerGraphTools } = await loadModule();
+
+      const stdioServer = createMockServer();
+      registerGraphTools(stdioServer as any, {} as any);
+      expect(stdioServer.tools.has('download-bytes-to-file')).toBe(true);
+      // download-bytes remains available in both modes.
+      expect(stdioServer.tools.has('download-bytes')).toBe(true);
+
+      const httpServer = createMockServer();
+      // httpMode is the 10th positional arg.
+      registerGraphTools(
+        httpServer as any,
+        {} as any,
+        false,
+        undefined,
+        false,
+        undefined,
+        false,
+        [],
+        undefined,
+        true
+      );
+      expect(httpServer.tools.has('download-bytes-to-file')).toBe(false);
+      expect(httpServer.tools.has('download-bytes')).toBe(true);
+    });
+  });
+
   // ---- 9b. get-download-url utility tool ----
   describe('get-download-url', () => {
     it('strips /content, fetches item metadata, and returns the pre-authed downloadUrl', async () => {
@@ -910,6 +1255,36 @@ describe('graph-tools', () => {
       expect(payload.name).toBe('report.pdf');
       expect(payload.size).toBe(12727);
       expect(payload.contentType).toBe('application/pdf');
+    });
+
+    it('forces a JSON body on the metadata request so it works under --toon (#560)', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+
+      const graphClient = {
+        graphRequest: vi.fn().mockResolvedValue({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ '@microsoft.graph.downloadUrl': 'https://dl.example/x' }),
+            },
+          ],
+        }),
+      };
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const result = await server.tools
+        .get('get-download-url')!
+        .handler({ target: '/drives/d1/items/item1/content' });
+
+      // Without forceJsonOutput the client would TOON-encode the metadata and the
+      // handler's JSON.parse would fail, masking a valid item as "no download url".
+      const [, opts] = graphClient.graphRequest.mock.calls[0];
+      expect(opts?.forceJsonOutput).toBe(true);
+      expect(JSON.parse(result.content[0].text).downloadUrl).toBe('https://dl.example/x');
     });
 
     it('rejects query-shaped targets instead of silently changing request semantics', async () => {
@@ -1572,6 +1947,295 @@ describe('graph-tools', () => {
       // readOnlyHint: true so they should be present.
       expect(server.tools.has('download-bytes')).toBe(true);
       expect(server.tools.has('parse-teams-url')).toBe(true);
+    });
+  });
+
+  // ---- destructive-operation confirm: true gate (CT-03) ----
+  describe('destructive operations require confirm: true', () => {
+    const prevRequireConfirm = process.env.MS365_MCP_REQUIRE_CONFIRM;
+
+    beforeEach(() => {
+      // The confirm gate is opt-in (off by default); enable it for the
+      // gate-behaviour tests below. The default-off case is asserted explicitly.
+      process.env.MS365_MCP_REQUIRE_CONFIRM = 'true';
+    });
+
+    afterEach(() => {
+      if (prevRequireConfirm === undefined) delete process.env.MS365_MCP_REQUIRE_CONFIRM;
+      else process.env.MS365_MCP_REQUIRE_CONFIRM = prevRequireConfirm;
+    });
+
+    it('rejects DELETE without confirm: true and does NOT call Graph', async () => {
+      const endpoint = makeEndpoint({
+        method: 'delete',
+        path: '/me/messages/:message-id',
+        alias: 'delete-mail-message',
+      });
+      const config = makeConfig({
+        pathPattern: '/me/messages/{message-id}',
+        method: 'delete',
+        toolName: 'delete-mail-message',
+      });
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient();
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('delete-mail-message');
+      const result: any = await tool!.handler({ messageId: 'abc' });
+
+      expect(graphClient.graphRequest).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toBe('confirmation_required');
+      expect(payload.tool).toBe('delete-mail-message');
+      expect(payload.destructive).toBe(true);
+    });
+
+    it('allows DELETE when confirm: true is passed', async () => {
+      const endpoint = makeEndpoint({
+        method: 'delete',
+        path: '/me/messages/:message-id',
+        alias: 'delete-mail-message',
+      });
+      const config = makeConfig({
+        pathPattern: '/me/messages/{message-id}',
+        method: 'delete',
+        toolName: 'delete-mail-message',
+      });
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify({ status: 204 }) }] },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('delete-mail-message');
+      await tool!.handler({ messageId: 'abc', confirm: true });
+
+      expect(graphClient.graphRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it('does NOT send `confirm` to Graph as a query/body parameter', async () => {
+      const endpoint = makeEndpoint({
+        method: 'post',
+        path: '/me/sendMail',
+        alias: 'send-mail',
+        parameters: [{ name: 'message', type: 'Body', schema: z.any() }],
+      });
+      const config = makeConfig({
+        pathPattern: '/me/sendMail',
+        method: 'post',
+        toolName: 'send-mail',
+      });
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify({ status: 202 }) }] },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('send-mail');
+      await tool!.handler({ message: { subject: 'hi' }, confirm: true });
+
+      const [url, opts] = graphClient.graphRequest.mock.calls[0];
+      expect(url).not.toContain('confirm');
+      // Body should be the message object, no `confirm` leaked
+      const body = JSON.parse(opts.body);
+      expect(body).not.toHaveProperty('confirm');
+    });
+
+    it('allows GET (read-only) regardless of confirm', async () => {
+      const endpoint = makeEndpoint(); // default is GET
+      const config = makeConfig();
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify({ value: [] }) }] },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('test-tool');
+      await tool!.handler({}); // No confirm
+      expect(graphClient.graphRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it('allows POST endpoints flagged readOnly without confirm (e.g. find-meeting-times)', async () => {
+      const endpoint = makeEndpoint({
+        method: 'post',
+        path: '/me/findMeetingTimes',
+        alias: 'find-meeting-times',
+      });
+      const config = makeConfig({
+        pathPattern: '/me/findMeetingTimes',
+        method: 'post',
+        toolName: 'find-meeting-times',
+        readOnly: true,
+      });
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify({ meetingTimeSuggestions: [] }) }] },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('find-meeting-times');
+      await tool!.handler({});
+      expect(graphClient.graphRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it('does NOT gate when MS365_MCP_REQUIRE_CONFIRM is unset (opt-in, off by default)', async () => {
+      delete process.env.MS365_MCP_REQUIRE_CONFIRM;
+      const endpoint = makeEndpoint({
+        method: 'delete',
+        path: '/me/messages/:message-id',
+        alias: 'delete-mail-message',
+      });
+      const config = makeConfig({
+        pathPattern: '/me/messages/{message-id}',
+        method: 'delete',
+        toolName: 'delete-mail-message',
+      });
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify({ status: 204 }) }] },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('delete-mail-message');
+      await tool!.handler({ messageId: 'abc' }); // No confirm — gate off by default
+      expect(graphClient.graphRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it('does NOT gate when MS365_MCP_REQUIRE_CONFIRM=false (explicit off)', async () => {
+      process.env.MS365_MCP_REQUIRE_CONFIRM = 'false';
+      const endpoint = makeEndpoint({
+        method: 'delete',
+        path: '/me/messages/:message-id',
+        alias: 'delete-mail-message',
+      });
+      const config = makeConfig({
+        pathPattern: '/me/messages/{message-id}',
+        method: 'delete',
+        toolName: 'delete-mail-message',
+      });
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify({ status: 204 }) }] },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('delete-mail-message');
+      await tool!.handler({ messageId: 'abc' }); // No confirm
+      expect(graphClient.graphRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects `confirm: false` as not equal to true', async () => {
+      const endpoint = makeEndpoint({
+        method: 'patch',
+        path: '/me/messages/:message-id',
+        alias: 'update-mail-message',
+      });
+      const config = makeConfig({
+        pathPattern: '/me/messages/{message-id}',
+        method: 'patch',
+        toolName: 'update-mail-message',
+      });
+      mockEndpoints.push(endpoint);
+      mockEndpointsJson = [config];
+
+      const graphClient = createMockGraphClient();
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('update-mail-message');
+      const result: any = await tool!.handler({ messageId: 'abc', confirm: false });
+      expect(graphClient.graphRequest).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+    });
+
+    it('exposes confirm in the schema only for destructive tools', async () => {
+      // GET tool — no confirm
+      mockEndpoints.push(makeEndpoint());
+      mockEndpointsJson = [makeConfig()];
+
+      // DELETE tool — confirm required
+      mockEndpoints.push(
+        makeEndpoint({ method: 'delete', alias: 'destructive-tool', path: '/me/items/:item-id' })
+      );
+      mockEndpointsJson.push(
+        makeConfig({
+          method: 'delete',
+          toolName: 'destructive-tool',
+          pathPattern: '/me/items/{item-id}',
+        })
+      );
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, createMockGraphClient() as any);
+
+      expect(server.tools.get('test-tool')!.schema).not.toHaveProperty('confirm');
+      expect(server.tools.get('destructive-tool')!.schema).toHaveProperty('confirm');
+    });
+  });
+
+  // ---- isDestructiveOperation helper ----
+  describe('isDestructiveOperation', () => {
+    it('returns true for POST, PATCH, PUT, DELETE', async () => {
+      const { isDestructiveOperation } = await loadModule();
+      expect(isDestructiveOperation('POST', undefined)).toBe(true);
+      expect(isDestructiveOperation('PATCH', undefined)).toBe(true);
+      expect(isDestructiveOperation('PUT', undefined)).toBe(true);
+      expect(isDestructiveOperation('DELETE', undefined)).toBe(true);
+    });
+
+    it('is case-insensitive', async () => {
+      const { isDestructiveOperation } = await loadModule();
+      expect(isDestructiveOperation('delete', undefined)).toBe(true);
+      expect(isDestructiveOperation('Patch', undefined)).toBe(true);
+    });
+
+    it('returns false for GET / HEAD / OPTIONS', async () => {
+      const { isDestructiveOperation } = await loadModule();
+      expect(isDestructiveOperation('GET', undefined)).toBe(false);
+      expect(isDestructiveOperation('HEAD', undefined)).toBe(false);
+      expect(isDestructiveOperation('OPTIONS', undefined)).toBe(false);
+    });
+
+    it('returns false for POST endpoints flagged readOnly', async () => {
+      const { isDestructiveOperation } = await loadModule();
+      expect(isDestructiveOperation('POST', { readOnly: true } as any)).toBe(false);
+    });
+
+    it('still returns true for PATCH/DELETE even if config.readOnly is set (should not happen but defensive)', async () => {
+      const { isDestructiveOperation } = await loadModule();
+      expect(isDestructiveOperation('PATCH', { readOnly: true } as any)).toBe(true);
+      expect(isDestructiveOperation('DELETE', { readOnly: true } as any)).toBe(true);
     });
   });
 });

@@ -9,6 +9,8 @@ import {
   getSharedBreaker,
   loadResilienceConfig,
 } from './lib/graph-resilience.js';
+import { open, stat, unlink } from 'fs/promises';
+import { pipeline } from 'stream/promises';
 
 /**
  * Returns true if the given HTTP Content-Type header indicates a binary
@@ -57,6 +59,9 @@ interface GraphRequestOptions {
   // Graph API version segment for the request path. Defaults to 'v1.0'; endpoints
   // declaring "apiVersion": "beta" in endpoints.json route to the /beta surface.
   apiVersion?: string;
+  // Pin this response to JSON regardless of the configured format, so the
+  // fetchAllPages merge can JSON.parse each page before re-encoding (#560).
+  forceJsonOutput?: boolean;
 
   [key: string]: unknown;
 }
@@ -74,6 +79,11 @@ interface McpResponse {
   isError?: boolean;
 
   [key: string]: unknown;
+}
+
+export interface GraphDownloadResult {
+  contentType: string;
+  contentLength: number;
 }
 
 class GraphClient {
@@ -179,6 +189,78 @@ class GraphClient {
     }
   }
 
+  /**
+   * Stream Graph byte content straight to a file, without holding the whole
+   * payload in memory. download-bytes-to-file uses this for big mail attachments
+   * and meeting recordings, where makeRequest's base64 buffering would blow up
+   * memory or hit V8's max string length. Creates the file with wx + 0o600 (never
+   * overwrites) and removes a partial file if the transfer fails.
+   */
+  async downloadToFile(
+    endpoint: string,
+    destinationPath: string,
+    options: Pick<GraphRequestOptions, 'accessToken' | 'apiVersion'> = {}
+  ): Promise<GraphDownloadResult> {
+    const fileHandle = await open(destinationPath, 'wx', 0o600);
+    let completed = false;
+
+    try {
+      const contextTokens = getRequestTokens();
+      const accessToken =
+        options.accessToken ?? contextTokens?.accessToken ?? (await this.authManager.getToken());
+      if (!accessToken) {
+        throw new Error('No access token available');
+      }
+
+      const response = await this.performRequest(endpoint, accessToken, options);
+      if (response.status === 403) {
+        const errorText = await response.text();
+        if (errorText.includes('scope') || errorText.includes('permission')) {
+          throw new Error(
+            `Microsoft Graph API scope error: ${response.status} ${response.statusText} - ${errorText}. This tool requires organization mode. Please restart with --org-mode flag.`
+          );
+        }
+        throw new Error(
+          `Microsoft Graph API error: ${response.status} ${response.statusText} - ${errorText}`
+        );
+      }
+      if (!response.ok) {
+        throw new Error(
+          `Microsoft Graph API error: ${response.status} ${response.statusText} - ${await response.text()}`
+        );
+      }
+      if (!response.body) {
+        throw new Error('Microsoft Graph returned an empty response body');
+      }
+
+      await pipeline(response.body, fileHandle.createWriteStream());
+      // Bytes are on disk now - a stat() hiccup past here must not delete them
+      // (that also blocks a retry, since we never overwrite).
+      completed = true;
+
+      let contentLength: number;
+      try {
+        contentLength = (await stat(destinationPath)).size;
+      } catch {
+        const header = Number(response.headers.get('content-length'));
+        contentLength = Number.isFinite(header) ? header : 0;
+      }
+
+      return {
+        contentType: response.headers.get('content-type') || 'application/octet-stream',
+        contentLength,
+      };
+    } catch (error) {
+      logger.error('Microsoft Graph file download failed:', error);
+      throw error;
+    } finally {
+      await fileHandle.close().catch(() => undefined);
+      if (!completed) {
+        await unlink(destinationPath).catch(() => undefined);
+      }
+    }
+  }
+
   private async performRequest(
     endpoint: string,
     accessToken: string,
@@ -221,14 +303,36 @@ class GraphClient {
     return JSON.stringify(data, null, pretty ? 2 : undefined);
   }
 
+  /**
+   * Encode a value in the configured format (json/toon). The fetchAllPages merge
+   * uses this to encode the combined result once, after parsing pages as JSON (#560).
+   * Compact by default like JSON.stringify, so JSON-mode output is byte-identical.
+   */
+  serialize(data: unknown, pretty = false): string {
+    return this.serializeData(data, this.outputFormat, pretty);
+  }
+
   async graphRequest(endpoint: string, options: GraphRequestOptions = {}): Promise<McpResponse> {
     try {
-      logger.info(`Calling ${endpoint} with options: ${JSON.stringify(options)}`);
+      // Redact accessToken from log output to prevent credential leakage (#601)
+      const { accessToken: _redacted, ...safeOptions } = options;
+      logger.info(
+        `Calling ${endpoint} with options: ${JSON.stringify(safeOptions)}${_redacted ? ' [accessToken=REDACTED]' : ''}`
+      );
 
       // Use new OAuth-aware request method
       const result = await this.makeRequest(endpoint, options);
 
-      return this.formatJsonResponse(result, options.rawResponse, options.excludeResponse);
+      // forceJsonOutput keeps this body JSON so the fetchAllPages merge can parse
+      // it; otherwise --toon would make the merge's JSON.parse throw (#560).
+      const outputFormat = options.forceJsonOutput ? 'json' : this.outputFormat;
+
+      return this.formatJsonResponse(
+        result,
+        options.rawResponse,
+        options.excludeResponse,
+        outputFormat
+      );
     } catch (error) {
       logger.error(`Error in Graph API request: ${error}`);
       return {
@@ -238,11 +342,16 @@ class GraphClient {
     }
   }
 
-  formatJsonResponse(data: unknown, rawResponse = false, excludeResponse = false): McpResponse {
+  formatJsonResponse(
+    data: unknown,
+    rawResponse = false,
+    excludeResponse = false,
+    outputFormat: 'json' | 'toon' = this.outputFormat
+  ): McpResponse {
     // If excludeResponse is true, only return success indication
     if (excludeResponse) {
       return {
-        content: [{ type: 'text', text: this.serializeData({ success: true }, this.outputFormat) }],
+        content: [{ type: 'text', text: this.serializeData({ success: true }, outputFormat) }],
       };
     }
 
@@ -264,18 +373,14 @@ class GraphClient {
 
       if (rawResponse) {
         return {
-          content: [
-            { type: 'text', text: this.serializeData(responseData.data, this.outputFormat) },
-          ],
+          content: [{ type: 'text', text: this.serializeData(responseData.data, outputFormat) }],
           _meta: meta,
         };
       }
 
       if (responseData.data === null || responseData.data === undefined) {
         return {
-          content: [
-            { type: 'text', text: this.serializeData({ success: true }, this.outputFormat) },
-          ],
+          content: [{ type: 'text', text: this.serializeData({ success: true }, outputFormat) }],
           _meta: meta,
         };
       }
@@ -301,7 +406,7 @@ class GraphClient {
 
       return {
         content: [
-          { type: 'text', text: this.serializeData(responseData.data, this.outputFormat, true) },
+          { type: 'text', text: this.serializeData(responseData.data, outputFormat, true) },
         ],
         _meta: meta,
       };
@@ -310,13 +415,13 @@ class GraphClient {
     // Original handling for backward compatibility
     if (rawResponse) {
       return {
-        content: [{ type: 'text', text: this.serializeData(data, this.outputFormat) }],
+        content: [{ type: 'text', text: this.serializeData(data, outputFormat) }],
       };
     }
 
     if (data === null || data === undefined) {
       return {
-        content: [{ type: 'text', text: this.serializeData({ success: true }, this.outputFormat) }],
+        content: [{ type: 'text', text: this.serializeData({ success: true }, outputFormat) }],
       };
     }
 
@@ -340,7 +445,7 @@ class GraphClient {
     removeODataProps(data as Record<string, unknown>);
 
     return {
-      content: [{ type: 'text', text: this.serializeData(data, this.outputFormat, true) }],
+      content: [{ type: 'text', text: this.serializeData(data, outputFormat, true) }],
     };
   }
 }

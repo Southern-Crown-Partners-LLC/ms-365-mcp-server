@@ -9,6 +9,7 @@ import logger, { enableConsoleLogging } from './logger.js';
 import { registerAuthTools } from './auth-tools.js';
 import { registerGraphTools, registerDiscoveryTools } from './graph-tools.js';
 import { buildMcpServerInstructions } from './mcp-instructions.js';
+import { installToolSchemaRefNormalization } from './normalize-tool-schema.js';
 import GraphClient from './graph-client.js';
 import AuthManager, {
   buildScopesFromEndpoints,
@@ -120,7 +121,8 @@ class MicrosoftGraphServer {
         this.multiAccount,
         this.accountNames,
         this.options.enabledTools,
-        this.options.allowedScopes
+        this.options.allowedScopes,
+        Boolean(this.options.http)
       );
     } else {
       registerGraphTools(
@@ -132,9 +134,16 @@ class MicrosoftGraphServer {
         this.authManager,
         this.multiAccount,
         this.accountNames,
-        this.options.allowedScopes
+        this.options.allowedScopes,
+        Boolean(this.options.http)
       );
     }
+
+    // Strict JSON-Schema backends (e.g. Kimi/Moonshot) reject a tools/list whose
+    // inputSchema $refs aren't anchored under #/$defs/. The SDK emits root-relative
+    // refs for recursive/shared Microsoft Graph schemas and hard-codes its conversion
+    // options, so normalize the emitted schemas here. See issue #571.
+    installToolSchemaRefNormalization(server);
 
     return server;
   }
@@ -692,50 +701,16 @@ class MicrosoftGraphServer {
         allowUnauthenticatedDiscovery: this.options.allowUnauthenticatedDiscovery,
         publicUrl: publicBase,
       });
-      app.get(
-        '/mcp',
-        mcpAuth,
-        async (req: Request & { microsoftAuth?: { accessToken: string } }, res: Response) => {
-          const handler = async () => {
-            const server = this.createMcpServer();
-            const transport = new StreamableHTTPServerTransport({
-              sessionIdGenerator: undefined, // Stateless mode
-            });
-
-            res.on('close', () => {
-              transport.close();
-              server.close();
-            });
-
-            await server.connect(transport);
-            await transport.handleRequest(req as any, res as any, undefined);
-          };
-
-          try {
-            if (req.microsoftAuth) {
-              let accessToken = req.microsoftAuth.accessToken;
-              if (this.oboClient) {
-                accessToken = await this.oboClient.exchangeToken(accessToken);
-              }
-              await requestContext.run({ accessToken }, handler);
-            } else {
-              await handler();
-            }
-          } catch (error) {
-            logger.error('Error handling MCP GET request:', error);
-            if (!res.headersSent) {
-              res.status(500).json({
-                jsonrpc: '2.0',
-                error: {
-                  code: -32603,
-                  message: 'Internal server error',
-                },
-                id: null,
-              });
-            }
-          }
-        }
-      );
+      app.get('/mcp', (req: Request, res: Response) => {
+        res.status(405).json({
+          jsonrpc: '2.0',
+          error: {
+            code: -32000,
+            message: 'Method not allowed.',
+          },
+          id: null,
+        });
+      });
 
       app.post(
         '/mcp',
@@ -745,6 +720,7 @@ class MicrosoftGraphServer {
             const server = this.createMcpServer();
             const transport = new StreamableHTTPServerTransport({
               sessionIdGenerator: undefined, // Stateless mode
+              enableJsonResponse: true, // Reply to POSTs with plain JSON, not one-shot SSE
             });
 
             res.on('close', () => {

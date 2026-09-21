@@ -3,6 +3,7 @@ import { readFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { getCombinedPresetPattern, listPresets, presetRequiresOrgMode } from './tool-categories.js';
+import { assertSignoffMarkersVisible } from './lib/message-signoff.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const packageJsonPath = path.join(__dirname, '..', 'package.json');
@@ -32,12 +33,33 @@ program
   )
   .option('--read-only', 'Start server in read-only mode, disabling write operations')
   .option(
+    '--message-signoff-prefix <text>',
+    'Signoff prepended to outgoing messages (Teams sends, replies and edits; mail sends and drafts) so recipients can tell they were agent-sent, e.g. 🤖 (default: none). Equivalent env var: MS365_MCP_MESSAGE_SIGNOFF_PREFIX.'
+  )
+  .option(
+    '--message-signoff-suffix <text>',
+    'Signoff appended to outgoing messages (default: none). Equivalent env var: MS365_MCP_MESSAGE_SIGNOFF_SUFFIX.'
+  )
+  .option('--no-message-signoff', 'Disable both message signoffs, overriding the env vars.')
+  .option(
     '--http [address]',
     'Use Streamable HTTP transport instead of stdio. Format: [host:]port (e.g., "localhost:3000", ":3000", "3000"). Default: all interfaces on port 3000'
   )
   .option(
     '--enable-auth-tools',
     'Enable login/logout tools when using HTTP mode (disabled by default in HTTP mode)'
+  )
+  .option(
+    '--enable-attachment-urls',
+    'HTTP mode only. Let get-download-url mint a short-TTL, single-use URL served by this server for Graph byte resources that expose no pre-authenticated URL of their own (mail and event attachments, meeting recordings, other $value endpoints). Requires MS365_MCP_ATTACHMENT_URL_BASE and MS365_MCP_ATTACHMENT_URL_KEY (or _KEY_FILE)'
+  )
+  .option(
+    '--attachment-port <port>',
+    'HTTP mode only. Serve the attachment download route on its own listener on this port instead of on the MCP app, so a caller that can fetch attachments cannot also reach /mcp. Requires --enable-attachment-urls, and MS365_MCP_ATTACHMENT_URL_BASE must name this port. A separate port only isolates the two surfaces if they also bind separate interfaces — see --attachment-host. Equivalent env var: MS365_MCP_ATTACHMENT_PORT.'
+  )
+  .option(
+    '--attachment-host <host>',
+    'Interface the --attachment-port listener binds (IPv4, IPv6 or hostname). Defaults to whatever --http bound, which with a wildcard --http means both ports answer on every interface — so a peer allowed onto the network to fetch attachments can also reach /mcp. Bind this to the address the fetcher uses and --http to a different one to make that unreachable rather than merely un-advertised. Requires --attachment-port. Equivalent env var: MS365_MCP_ATTACHMENT_HOST.'
   )
   .option(
     '--enabled-tools <pattern>',
@@ -53,7 +75,7 @@ program
   )
   .option(
     '--preset <names>',
-    'Use preset tool categories (comma-separated). Available: mail, calendar, files, personal, work, excel, contacts, tasks, onenote, search, users, all'
+    'Use preset tool categories (comma-separated). Available: mail, calendar, files, personal, work, excel, contacts, tasks, onenote, search, users, outlook, onedrive, teams, teams-write, all'
   )
   .option('--list-presets', 'List all available presets and exit')
   .option('--list-permissions', 'List all required Graph API permissions and exit')
@@ -72,7 +94,7 @@ program
   )
   .option(
     '--no-dynamic-registration',
-    'Disable OAuth Dynamic Client Registration endpoint in HTTP mode'
+    'Disable OAuth Dynamic Client Registration endpoint in HTTP mode. Equivalent env var: MS365_MCP_DISABLE_DCR=true.'
   )
   .option(
     '--auth-browser',
@@ -112,8 +134,25 @@ export interface CommandOptions {
   expectedUsername?: string;
   expectedHomeAccountId?: string;
   readOnly?: boolean;
+  messageSignoff?: boolean;
+  messageSignoffSuffix?: string;
+  messageSignoffPrefix?: string;
   http?: string | boolean;
   enableAuthTools?: boolean;
+  enableAttachmentUrls?: boolean;
+  /**
+   * Raw, unvalidated port for the split attachment listener. A string when it
+   * came from the command line or the environment; `server.ts` is what turns it
+   * into a number and refuses the values that are not one.
+   */
+  attachmentPort?: string | number;
+  /**
+   * Raw, unvalidated bind host for the split attachment listener. Unset means
+   * "inherit whatever --http bound", which is the pre-existing behaviour and
+   * stays the default. Validated in `server.ts` alongside the port, so the two
+   * halves of one decision are refused in one place.
+   */
+  attachmentHost?: string;
   enabledTools?: string;
   allowedScopes?: string;
   extraScopes?: string;
@@ -142,6 +181,21 @@ export interface CommandOptions {
 export function parseArgs(): CommandOptions {
   program.parse();
   const options = program.opts();
+
+  // Fold the signoff flags into the env vars that lib/message-signoff.ts reads at send time
+  if (typeof options.messageSignoffSuffix === 'string') {
+    process.env.MS365_MCP_MESSAGE_SIGNOFF_SUFFIX = options.messageSignoffSuffix;
+  }
+  if (typeof options.messageSignoffPrefix === 'string') {
+    process.env.MS365_MCP_MESSAGE_SIGNOFF_PREFIX = options.messageSignoffPrefix;
+  }
+  if (options.messageSignoff === false) {
+    process.env.MS365_MCP_MESSAGE_SIGNOFF_SUFFIX = '';
+    process.env.MS365_MCP_MESSAGE_SIGNOFF_PREFIX = '';
+  }
+  // Markup in a marker is allowed (e.g. a coloured <span>), but refuse to start
+  // with one that renders as empty text - html sends would look unsigned.
+  assertSignoffMarkersVisible();
 
   if (options.listPresets) {
     const presets = listPresets();
@@ -196,6 +250,23 @@ export function parseArgs(): CommandOptions {
         'Provide one or more whitespace-separated scopes, or omit it.'
     );
     process.exit(1);
+  }
+
+  // CLI wins over env, same as every other option here. Left as the raw string:
+  // the value is only meaningful together with --enable-attachment-urls and
+  // --http, and both of those are decided in server.ts, so that is where it is
+  // parsed and rejected -- one message, one place, whichever way it arrived.
+  if (options.attachmentPort === undefined && process.env.MS365_MCP_ATTACHMENT_PORT !== undefined) {
+    options.attachmentPort = process.env.MS365_MCP_ATTACHMENT_PORT;
+  }
+
+  // Same idiom, same reasoning, and deliberately a variable of its own rather
+  // than a host accepted inside MS365_MCP_ATTACHMENT_PORT: a variable named
+  // _PORT holding `10.89.0.5:3001` misreads at a glance, and the two values
+  // default differently -- an absent port means "no second listener", an absent
+  // host means "inherit the MCP one".
+  if (options.attachmentHost === undefined && process.env.MS365_MCP_ATTACHMENT_HOST !== undefined) {
+    options.attachmentHost = process.env.MS365_MCP_ATTACHMENT_HOST;
   }
 
   if (
@@ -269,10 +340,15 @@ export function parseArgs(): CommandOptions {
     options.toon = true;
   }
 
-  // Dynamic registration defaults to true in HTTP mode
-  // --enable-dynamic-registration (backwards compat) or --no-dynamic-registration to override
+  // Dynamic registration defaults to true in HTTP mode.
+  // CLI flags `--enable-dynamic-registration` / `--no-dynamic-registration` take
+  // precedence; otherwise `MS365_MCP_DISABLE_DCR=true|1` opts the deployment out
+  // (allows env-var-only configuration in container platforms without modifying
+  // process args).
   if (options.http) {
-    if (options.dynamicRegistration === false) {
+    const dcrDisabledByEnv =
+      process.env.MS365_MCP_DISABLE_DCR === 'true' || process.env.MS365_MCP_DISABLE_DCR === '1';
+    if (options.dynamicRegistration === false || dcrDisabledByEnv) {
       options.enableDynamicRegistration = false;
     } else {
       options.enableDynamicRegistration = true;

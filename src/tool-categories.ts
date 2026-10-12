@@ -19,7 +19,10 @@ const endpointEntries = JSON.parse(
 // which presets it belongs to via its `presets` array, so presets are exact
 // tool-name allow-lists that can't over-match across apps the way the old
 // loose name regexes could (e.g. "mail" also matching shared-mailbox tools).
-const PRESET_META: Record<string, { description: string; requiresOrgMode?: boolean }> = {
+const PRESET_META: Record<
+  string,
+  { description: string; requiresOrgMode?: boolean; omitUniversalUtilities?: boolean }
+> = {
   mail: {
     description: 'Email operations (read, send, manage folders, attachments)',
   },
@@ -66,15 +69,67 @@ const PRESET_META: Record<string, { description: string; requiresOrgMode?: boole
     description: 'Teams app only: chats, channels, meetings and presence',
     requiresOrgMode: true,
   },
+  'teams-write': {
+    description:
+      'Teams send-only: send/reply in chats and channels, list chats/teams/channels by name, activity notifications - no message reading',
+    requiresOrgMode: true,
+    // A write-only preset must not include the generic byte readers.
+    omitUniversalUtilities: true,
+  },
 };
 
+// Utility tools (graph-tools.ts UTILITY_TOOLS) are code-defined, not in endpoints.json, so they
+// carry no `presets` there and every --preset filter dropped them - e.g. `--preset files` had
+// get-drive-item but no downloader, though its llmTip tells the model to call one. Declare their
+// preset membership here and fold it into each preset pattern.
+//
+// download-bytes and download-bytes-to-file both read ANY relative Graph binary path (drive files,
+// attachments, photos, Teams content, recordings, OneNote resources) - one returns base64, the other
+// streams the bytes to a local file - so they belong in EVERY preset. Universal rather than an
+// enumerated list because a list would silently miss apps and every future preset.
+const UNIVERSAL_UTILITY_TOOLS = ['download-bytes', 'download-bytes-to-file'];
+
+// Scoped utilities are only meaningful where the resources they act on appear. Graph itself
+// publishes a pre-authenticated URL for drive/SharePoint file content ONLY (not mail/event
+// attachments or recordings), so get-download-url rides with the drive-backed presets; where it is
+// absent the universal download-bytes still reads the bytes. A server running with
+// --enable-attachment-urls mints its own URL for those other byte resources, so
+// getCombinedPresetPattern adds it to every preset then. parse-teams-url only parses Teams meeting
+// URLs.
+const SCOPED_UTILITY_TOOLS: Record<string, string[]> = {
+  'get-download-url': ['files', 'onedrive', 'personal', 'work', 'search'],
+  'get-upload-url': ['mail', 'calendar', 'outlook', 'personal', 'work'],
+  'parse-teams-url': ['teams', 'teams-write', 'work'],
+};
+
+// Fail fast if a scoped utility references a preset that does not exist (e.g. a typo like
+// 'serach'): otherwise the tool would silently never join the intended preset, with no error.
+for (const [tool, presets] of Object.entries(SCOPED_UTILITY_TOOLS)) {
+  for (const preset of presets) {
+    if (!Object.prototype.hasOwnProperty.call(PRESET_META, preset)) {
+      throw new Error(
+        `SCOPED_UTILITY_TOOLS["${tool}"] references unknown preset "${preset}" (not in PRESET_META)`
+      );
+    }
+  }
+}
+
 function presetPattern(preset: string): RegExp {
-  const names = [
+  const endpointNames = [
     ...new Set(endpointEntries.filter((e) => e.presets?.includes(preset)).map((e) => e.toolName)),
   ];
-  if (names.length === 0) {
+  // Guard on endpoint membership, not the final `names` list: the universal utility spread below
+  // would otherwise mask a preset that no endpoint declares (a typo'd or unwired preset name).
+  if (endpointNames.length === 0) {
     throw new Error(`Preset "${preset}" matches no endpoints in endpoints.json`);
   }
+  const names = [
+    ...endpointNames,
+    ...(PRESET_META[preset]?.omitUniversalUtilities ? [] : UNIVERSAL_UTILITY_TOOLS),
+    ...Object.entries(SCOPED_UTILITY_TOOLS)
+      .filter(([, presets]) => presets.includes(preset))
+      .map(([name]) => name),
+  ];
   return new RegExp(`^(?:${names.join('|')})$`);
 }
 
@@ -92,7 +147,10 @@ export const TOOL_CATEGORIES: Record<string, ToolCategory> = {
   },
 };
 
-export function getCombinedPresetPattern(presets: string[]): string {
+export function getCombinedPresetPattern(
+  presets: string[],
+  { attachmentUrls = false }: { attachmentUrls?: boolean } = {}
+): string {
   const patterns = presets.map((preset) => {
     const category = TOOL_CATEGORIES[preset];
     if (!category) {
@@ -102,6 +160,16 @@ export function getCombinedPresetPattern(presets: string[]): string {
     }
     return category.pattern.source;
   });
+  // With server-minted attachment URLs on, get-download-url is how an agent that found a mail or
+  // event attachment, recording or other $value resource gets a URL for it, so it must not depend
+  // on the preset having drive tools. Send-only presets stay free of byte readers.
+  if (
+    attachmentUrls &&
+    presets.some((p) => !PRESET_META[p]?.omitUniversalUtilities) &&
+    !patterns.some((p) => new RegExp(p).test('get-download-url'))
+  ) {
+    patterns.push('^get-download-url$');
+  }
   return patterns.join('|');
 }
 

@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
-import { registerGraphTools } from '../src/graph-tools.js';
 import type { GraphClient } from '../src/graph-client.js';
+import { registerGraphTools } from '../src/graph-tools.js';
 
 vi.mock('../src/logger.js', () => ({
   default: {
@@ -37,12 +37,12 @@ vi.mock('../src/generated/client.js', () => ({
 }));
 
 describe('Path parameter encoding (issue #245)', () => {
-  let mockServer: { tool: ReturnType<typeof vi.fn> };
+  let mockServer: { tool: ReturnType<typeof vi.fn>; registerTool: ReturnType<typeof vi.fn> };
   let mockGraphClient: GraphClient;
 
   beforeEach(() => {
     vi.clearAllMocks();
-    mockServer = { tool: vi.fn() };
+    mockServer = { tool: vi.fn(), registerTool: vi.fn() };
     mockGraphClient = {
       graphRequest: vi.fn().mockResolvedValue({
         content: [{ type: 'text', text: JSON.stringify({ value: [] }) }],
@@ -51,8 +51,8 @@ describe('Path parameter encoding (issue #245)', () => {
   });
 
   function getToolHandler(toolName: string) {
-    registerGraphTools(mockServer, mockGraphClient, false);
-    const call = mockServer.tool.mock.calls.find((c: unknown[]) => c[0] === toolName);
+    registerGraphTools(mockServer, mockGraphClient);
+    const call = mockServer.registerTool.mock.calls.find((c: unknown[]) => c[0] === toolName);
     expect(call).toBeDefined();
     return call![call!.length - 1] as (params: Record<string, unknown>) => Promise<unknown>;
   }

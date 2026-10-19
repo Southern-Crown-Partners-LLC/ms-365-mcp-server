@@ -8,7 +8,7 @@ import path from 'path';
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 if (!globalThis.File) (globalThis as any).File = Blob;
 
-const { api } = await import('../src/generated/client.js');
+const { api, schemas } = await import('../src/generated/client.js');
 const { api: betaApi } = await import('../src/generated/client-beta.js');
 
 const __filename = fileURLToPath(import.meta.url);
@@ -22,6 +22,10 @@ interface Endpoint {
   workScopes?: string[] | string[][];
   returnDownloadUrl?: boolean;
   llmTip?: string;
+  queryParams?: string[];
+  maxTop?: number;
+  nameFilter?: boolean;
+  mentionShorthand?: boolean;
 }
 
 const endpoints: Endpoint[] = JSON.parse(
@@ -142,5 +146,120 @@ describe('endpoints.json validation', () => {
     expect(endpoint?.llmTip).toContain('call get-download-url');
     expect(endpoint?.llmTip).toContain('out-of-band');
     expect(endpoint?.llmTip).toContain('call download-bytes');
+  });
+
+  it('should route To Do step edits to the checklist-item tools, not update-todo-task', () => {
+    const checklistTools = [
+      'list-todo-checklist-items',
+      'create-todo-checklist-item',
+      'update-todo-checklist-item',
+      'delete-todo-checklist-item',
+    ];
+
+    for (const toolName of checklistTools) {
+      const endpoint = endpoints.find((e) => e.toolName === toolName);
+      expect(endpoint, `${toolName} should exist`).toBeDefined();
+      expect(endpoint?.scopes).toEqual(
+        endpoint?.method === 'get' ? ['Tasks.Read'] : ['Tasks.ReadWrite']
+      );
+    }
+
+    // Graph 400s a PATCH on the task that carries checklistItems, so the model has to be
+    // pointed at the /checklistItems tools instead.
+    const updateTask = endpoints.find((e) => e.toolName === 'update-todo-task');
+    expect(updateTask?.llmTip).toContain('update-todo-checklist-item');
+    expect(updateTask?.llmTip).toContain('create-todo-checklist-item');
+    expect(updateTask?.llmTip).toContain('delete-todo-checklist-item');
+  });
+
+  it('should document the @mention shape on the Teams send/reply tools', () => {
+    const mentionTools = [
+      'send-chat-message',
+      'send-channel-message',
+      'reply-to-channel-message',
+      'reply-to-chat-message',
+    ];
+
+    for (const toolName of mentionTools) {
+      const endpoint = endpoints.find((e) => e.toolName === toolName);
+      expect(endpoint, `${toolName} should exist`).toBeDefined();
+      // Model omits userIdentityType without this, and Graph 400s (issue #558)
+      expect(endpoint?.llmTip, `${toolName} llmTip`).toContain('<at id');
+      expect(endpoint?.llmTip, `${toolName} llmTip`).toContain('userIdentityType');
+    }
+  });
+
+  describe('per-tool behavior fields', () => {
+    const generated = new Map([...api.endpoints, ...betaApi.endpoints].map((e) => [e.alias, e]));
+    const queryNames = (toolName: string) =>
+      (generated.get(toolName)?.parameters ?? [])
+        .filter((p) => p.type === 'Query')
+        .map((p) => p.name.replace(/^\$/, '').toLowerCase());
+
+    it('lists only query params the generated tool has, plus the skiptoken cursor', () => {
+      for (const e of endpoints.filter((x) => x.queryParams)) {
+        const known = new Set([...queryNames(e.toolName), 'skiptoken']);
+        const listed = e.queryParams!.map((p) => p.toLowerCase());
+        for (const name of listed) {
+          expect(known.has(name), `${e.toolName} queryParams has unknown "${name}"`).toBe(true);
+        }
+        expect(new Set(listed).size, `${e.toolName} queryParams has duplicates`).toBe(
+          listed.length
+        );
+      }
+    });
+
+    it('caps $top only where the tool takes $top', () => {
+      for (const e of endpoints.filter((x) => x.maxTop !== undefined)) {
+        expect(Number.isInteger(e.maxTop) && e.maxTop! > 0, `${e.toolName} maxTop`).toBe(true);
+        expect(queryNames(e.toolName), `${e.toolName} has no $top`).toContain('top');
+        if (e.queryParams) expect(e.queryParams.map((p) => p.toLowerCase())).toContain('top');
+      }
+    });
+
+    it('puts nameFilter only on GET tools', () => {
+      for (const e of endpoints.filter((x) => x.nameFilter)) {
+        expect(e.method, `${e.toolName} nameFilter`).toBe('get');
+      }
+    });
+
+    // Nothing in the body schema explains the shorthand, so a flag the llmTip doesn't
+    // mention is invisible to the model, and a tip without the flag promises a rewrite
+    // the server doesn't do
+    it('puts mentionShorthand exactly on the tools whose llmTip explains <at user-id>', () => {
+      for (const e of endpoints) {
+        expect(!!e.mentionShorthand, `${e.toolName} mentionShorthand`).toBe(
+          !!e.llmTip?.includes('user-id=')
+        );
+        if (e.mentionShorthand) {
+          expect(['post', 'patch'], `${e.toolName} mentionShorthand`).toContain(e.method);
+        }
+      }
+    });
+  });
+
+  it('should accept and preserve userIdentityType on a mentions payload (passthrough schema)', () => {
+    const chatMessage = (
+      schemas as Record<string, { safeParse: (v: unknown) => { success: boolean; data?: unknown } }>
+    ).microsoft_graph_chatMessage;
+    const payload = {
+      body: { contentType: 'html', content: 'Hi <at id="0">Jane</at>' },
+      mentions: [
+        {
+          id: 0,
+          mentionText: 'Jane',
+          mentioned: { user: { id: 'guid', displayName: 'Jane', userIdentityType: 'aadUser' } },
+        },
+      ],
+    };
+
+    const result = chatMessage.safeParse(payload);
+    expect(result.success).toBe(true);
+    // userIdentityType isn't a modeled field - it survives only because the schemas are
+    // .passthrough(). So this guards the codegen trait, not request serialization.
+    const mentioned = (
+      result.data as { mentions: Array<{ mentioned: { user: { userIdentityType?: string } } }> }
+    ).mentions[0].mentioned.user;
+    expect(mentioned.userIdentityType).toBe('aadUser');
   });
 });

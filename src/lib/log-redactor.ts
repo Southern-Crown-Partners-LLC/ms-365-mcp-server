@@ -1,11 +1,13 @@
 /**
- * Opt-in redaction of sensitive material from log output.
+ * Redaction of sensitive material from log output. On by default.
  *
  * Error messages bubbled up from upstream libraries (MSAL, fetch, the Graph
  * SDK) routinely interpolate request URLs, Authorization headers, and token
  * payloads into their message strings. When those land in a log file or the
- * console they expose bearer/refresh tokens and user identifiers. Enabling
- * `MS365_MCP_REDACT_PII` runs each log message through the patterns below.
+ * console they expose bearer/refresh tokens and user identifiers, and this
+ * server necessarily handles live Graph bearer tokens with mail/calendar/
+ * contacts read-write scopes. Every log message is run through the patterns
+ * below unless an operator explicitly opts out with `MS365_MCP_REDACT_PII=false`.
  *
  * Patterns are intentionally generic (JWTs, Bearer headers, OAuth token
  * fields, email addresses) — no jurisdiction-specific identifiers — so the
@@ -45,17 +47,45 @@ const REDACTIONS: RedactionPattern[] = [
     pattern: /([?&]code=)[^&\s"']+/gi,
     replacement: '$1[REDACTED]',
   },
-  // Email addresses / UPNs
-  {
-    pattern: /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g,
-    replacement: '[REDACTED_EMAIL]',
-  },
 ];
 
-/** Whether opt-in PII redaction is enabled via MS365_MCP_REDACT_PII=true|1. */
+// Email addresses / UPNs. Not a plain global regex: `[A-Za-z0-9._%+-]+@...` is
+// quadratic on a long run of local-part characters with no `@`, and base64 of
+// text (e.g. an attachment's contentBytes) is exactly such a run. Instead
+// anchor on each `@`, walk the local part backwards once, and match the domain
+// with a sticky regex, so the cost stays linear in the message length.
+const EMAIL_LOCAL_CHAR = /[A-Za-z0-9._%+-]/;
+const EMAIL_DOMAIN = /[A-Za-z0-9.-]+\.[A-Za-z]{2,}/y;
+
+function redactEmails(input: string): string {
+  let at = input.indexOf('@');
+  if (at === -1) return input;
+  let out = '';
+  let copied = 0; // input[0, copied) is already in `out`
+  while (at !== -1) {
+    let start = at;
+    while (start > copied && EMAIL_LOCAL_CHAR.test(input[start - 1])) start--;
+    EMAIL_DOMAIN.lastIndex = at + 1;
+    const domain = start < at ? EMAIL_DOMAIN.exec(input) : null;
+    if (domain) {
+      out += input.slice(copied, start) + '[REDACTED_EMAIL]';
+      copied = at + 1 + domain[0].length;
+      at = input.indexOf('@', copied);
+    } else {
+      at = input.indexOf('@', at + 1);
+    }
+  }
+  return out + input.slice(copied);
+}
+
+/**
+ * Whether PII/secret redaction is enabled. On by default; set
+ * MS365_MCP_REDACT_PII=false|0 to opt out and get fully verbose logs.
+ */
 export function redactionEnabled(): boolean {
   const raw = process.env.MS365_MCP_REDACT_PII;
-  return raw === 'true' || raw === '1';
+  if (raw === undefined) return true;
+  return raw !== 'false' && raw !== '0';
 }
 
 /** Applies every redaction pattern to `input` and returns the scrubbed string. */
@@ -64,5 +94,5 @@ export function redactSensitive(input: string): string {
   for (const { pattern, replacement } of REDACTIONS) {
     out = out.replace(pattern, replacement);
   }
-  return out;
+  return redactEmails(out);
 }

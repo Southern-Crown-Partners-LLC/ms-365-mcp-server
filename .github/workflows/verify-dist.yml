@@ -54,5 +54,8 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add dist/
           git commit -m "chore: rebuild vendored dist/ on CI [skip ci]"
+          # `npm run generate` can leave uncommitted changes outside dist/,
+          # which makes `git pull --rebase` refuse to run. Drop them.
+          git reset --hard HEAD
           git pull --rebase origin scp-main
           git push origin scp-main

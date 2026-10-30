@@ -1,5 +1,8 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { z } from 'zod';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 /**
  * We test executeGraphTool logic by importing it indirectly through registerGraphTools.
@@ -863,6 +866,102 @@ describe('graph-tools', () => {
       expect(result.isError).toBe(true);
       const payload = JSON.parse(result.content[0].text);
       expect(payload.error).toMatch(/relative Microsoft Graph path/);
+    });
+
+    describe('savePath', () => {
+      let tmpDir: string;
+
+      beforeEach(() => {
+        tmpDir = mkdtempSync(join(tmpdir(), 'download-bytes-'));
+      });
+
+      afterEach(() => {
+        rmSync(tmpDir, { recursive: true, force: true });
+      });
+
+      async function getTool(graphClient: unknown) {
+        mockEndpoints.length = 0;
+        mockEndpointsJson = [];
+        const server = createMockServer();
+        const { registerGraphTools } = await loadModule();
+        registerGraphTools(server as any, graphClient as any);
+        return server.tools.get('download-bytes')!;
+      }
+
+      it('writes decoded binary bytes to disk and returns no base64', async () => {
+        const pdf = Buffer.from('%PDF-1.4\n\x00\xff binary');
+        const graphClient = {
+          graphRequest: vi.fn(),
+          makeRequest: vi.fn().mockResolvedValue({
+            message: 'OK!',
+            contentType: 'application/pdf',
+            encoding: 'base64',
+            contentLength: pdf.byteLength,
+            contentBytes: pdf.toString('base64'),
+          }),
+        };
+        const tool = await getTool(graphClient);
+        const savePath = join(tmpDir, 'nested', 'receipt.pdf');
+
+        const result = await tool.handler({
+          target: '/me/messages/m/attachments/a/$value',
+          savePath,
+        });
+
+        expect(result.isError).toBeUndefined();
+        expect(graphClient.graphRequest).not.toHaveBeenCalled();
+        expect(readFileSync(savePath).equals(pdf)).toBe(true);
+        const payload = JSON.parse(result.content[0].text);
+        expect(payload).toEqual({
+          savedTo: savePath,
+          contentType: 'application/pdf',
+          contentLength: pdf.byteLength,
+        });
+        expect(result.content[0].text).not.toContain(pdf.toString('base64'));
+      });
+
+      it('writes text bodies as UTF-8', async () => {
+        const graphClient = {
+          graphRequest: vi.fn(),
+          makeRequest: vi.fn().mockResolvedValue({ message: 'OK!', rawResponse: '{"body":"é"}' }),
+        };
+        const tool = await getTool(graphClient);
+        const savePath = join(tmpDir, 'message.json');
+
+        await tool.handler({ target: '/me/messages/m', savePath });
+
+        expect(readFileSync(savePath, 'utf8')).toBe('{"body":"é"}');
+      });
+
+      it('rejects a relative savePath without calling Graph', async () => {
+        const graphClient = { graphRequest: vi.fn(), makeRequest: vi.fn() };
+        const tool = await getTool(graphClient);
+
+        const result = await tool.handler({ target: '/me/photo/$value', savePath: 'photo.jpg' });
+
+        expect(result.isError).toBe(true);
+        expect(JSON.parse(result.content[0].text).error).toMatch(/absolute/);
+        expect(graphClient.makeRequest).not.toHaveBeenCalled();
+      });
+
+      it('refuses to overwrite an existing file unless overwrite is true', async () => {
+        const graphClient = {
+          graphRequest: vi.fn(),
+          makeRequest: vi.fn().mockResolvedValue({ message: 'OK!', rawResponse: 'new' }),
+        };
+        const tool = await getTool(graphClient);
+        const savePath = join(tmpDir, 'existing.txt');
+        writeFileSync(savePath, 'old');
+
+        const refused = await tool.handler({ target: '/me/messages/m', savePath });
+        expect(refused.isError).toBe(true);
+        expect(JSON.parse(refused.content[0].text).error).toMatch(/already exists/);
+        expect(readFileSync(savePath, 'utf8')).toBe('old');
+        expect(graphClient.makeRequest).not.toHaveBeenCalled();
+
+        await tool.handler({ target: '/me/messages/m', savePath, overwrite: true });
+        expect(readFileSync(savePath, 'utf8')).toBe('new');
+      });
     });
   });
 

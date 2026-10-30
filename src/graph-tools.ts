@@ -16,7 +16,7 @@ import { api as betaApi } from './generated/client-beta.js';
 // and the runtime picks the URL prefix per request. v1.0 endpoints are unchanged.
 const allEndpoints = [...api.endpoints, ...betaApi.endpoints];
 import { z } from 'zod';
-import { readFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { TOOL_CATEGORIES } from './tool-categories.js';
@@ -286,7 +286,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
     method: 'GET',
     path: 'tool:download-bytes',
     description:
-      'Download binary content from Microsoft Graph and return it as base64. Single tool for any binary read: drive file content, mail attachment, profile photo, Teams hosted content, meeting recording. Returns { contentType, encoding: "base64", contentLength, contentBytes }. For large drive/SharePoint file content, prefer get-download-url, which returns a pre-authenticated URL to stream bytes out-of-band instead of base64 through the agent context.',
+      'Download binary content from Microsoft Graph and return it as base64. Single tool for any binary read: drive file content, mail attachment, profile photo, Teams hosted content, meeting recording. Returns { contentType, encoding: "base64", contentLength, contentBytes }. Pass savePath to write the bytes to a local file instead; the response is then { savedTo, contentType, contentLength } with no base64 (use this whenever the file is needed on disk, e.g. to upload it elsewhere). For large drive/SharePoint file content, prefer get-download-url, which returns a pre-authenticated URL to stream bytes out-of-band instead of base64 through the agent context.',
     readOnlyHint: true,
     openWorldHint: true,
     buildSchema: (ctx) => {
@@ -302,6 +302,16 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
               '/teams/{team-id}/channels/{channel-id}/messages/{chatMessage-id}/hostedContents/{chatMessageHostedContent-id}/$value (Teams channel hosted content). ' +
               'For meeting recordings, use get-meeting-recording-content where available; Microsoft Graph returns authenticated recording bytes, not a pre-authenticated download URL.'
           ),
+        savePath: z
+          .string()
+          .optional()
+          .describe(
+            'Optional absolute local file path. When set, the bytes are written to this file (parent folders are created) and only { savedTo, contentType, contentLength } is returned.'
+          ),
+        overwrite: z
+          .boolean()
+          .optional()
+          .describe('With savePath: replace the file if it already exists. Defaults to false.'),
       };
       if (ctx.multiAccount) {
         schema['account'] = z
@@ -353,13 +363,76 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         if (authManager && !authManager.isOAuthModeEnabled() && !getRequestTokens()) {
           accountAccessToken = await authManager.getTokenForAccount(accountParam);
         }
-        // rawResponse keeps the body byte-faithful: binary stays base64 and a
-        // JSON body is returned verbatim instead of being re-serialized lossily
-        // through JSON.parse -> JSON.stringify (issue #546).
-        return await graphClient.graphRequest(target, {
+        const savePath = params.savePath as string | undefined;
+        if (savePath === undefined) {
+          // rawResponse keeps the body byte-faithful: binary stays base64 and a
+          // JSON body is returned verbatim instead of being re-serialized lossily
+          // through JSON.parse -> JSON.stringify (issue #546).
+          return await graphClient.graphRequest(target, {
+            accessToken: accountAccessToken,
+            rawResponse: true,
+          });
+        }
+        if (typeof savePath !== 'string' || !path.isAbsolute(savePath)) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({ error: 'savePath must be an absolute local file path.' }),
+              },
+            ],
+            isError: true,
+          };
+        }
+        if (existsSync(savePath) && params.overwrite !== true) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  error: `File already exists: ${savePath}. Pass overwrite: true to replace it.`,
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
+        // Read the unserialized result so the write does not depend on the
+        // configured output format. Binary bodies arrive as
+        // { contentType, encoding: 'base64', contentBytes }; text bodies as
+        // { rawResponse }. Write the decoded bytes, never the base64.
+        const result = (await graphClient.makeRequest(target, {
           accessToken: accountAccessToken,
           rawResponse: true,
-        });
+        })) as {
+          contentType?: string;
+          encoding?: string;
+          contentBytes?: string;
+          rawResponse?: string;
+        };
+        let bytes: Buffer;
+        if (result.encoding === 'base64' && typeof result.contentBytes === 'string') {
+          bytes = Buffer.from(result.contentBytes, 'base64');
+        } else if (typeof result.rawResponse === 'string') {
+          bytes = Buffer.from(result.rawResponse, 'utf8');
+        } else {
+          bytes = Buffer.alloc(0);
+        }
+        const contentType = result.contentType;
+        mkdirSync(path.dirname(savePath), { recursive: true });
+        writeFileSync(savePath, bytes);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                savedTo: savePath,
+                contentType,
+                contentLength: bytes.byteLength,
+              }),
+            },
+          ],
+        };
       } catch (error) {
         return {
           content: [{ type: 'text', text: JSON.stringify({ error: (error as Error).message }) }],

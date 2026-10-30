@@ -291,7 +291,7 @@ const microsoft_graph_chatMessage = z.lazy(
     deletedDateTime: z.string().regex(
       /^[0-9]{4,}-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{1,12})?(Z|[+-][0-9][0-9]:[0-9][0-9])$/
     ).datetime({ offset: true }).describe(
-      "Read only. Timestamp at which the chat message was deleted, or null if not deleted."
+      "Read-only. Timestamp at which the chat message was deleted, or null if not deleted."
     ).nullish(),
     etag: z.string().describe("Read-only. Version number of the chat message.").nullish(),
     eventDetail: microsoft_graph_eventMessageDetail.optional(),
@@ -300,12 +300,12 @@ const microsoft_graph_chatMessage = z.lazy(
     lastEditedDateTime: z.string().regex(
       /^[0-9]{4,}-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{1,12})?(Z|[+-][0-9][0-9]:[0-9][0-9])$/
     ).datetime({ offset: true }).describe(
-      "Read only. Timestamp when edits to the chat message were made. Triggers an 'Edited' flag in the Teams UI. If no edits are made the value is null."
+      "Read-only. Timestamp when edits to the chat message were made. Triggers an 'Edited' flag in the Teams UI. If no edits are made the value is null."
     ).nullish(),
     lastModifiedDateTime: z.string().regex(
       /^[0-9]{4,}-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{1,12})?(Z|[+-][0-9][0-9]:[0-9][0-9])$/
     ).datetime({ offset: true }).describe(
-      "Read only. Timestamp when the chat message is created (initial setting) or modified, including when a reaction is added or removed."
+      "Read-only. Timestamp when the chat message is created (initial setting) or modified, including when a reaction is added or removed."
     ).nullish(),
     locale: z.string().describe("Locale of the chat message set by the client. Always set to en-us.").optional(),
     mentions: z.array(microsoft_graph_chatMessageMention).describe(
@@ -373,7 +373,7 @@ const microsoft_graph_targetedChatMessage = z.object({
   lastModifiedDateTime: z.string().regex(
     /^[0-9]{4,}-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{1,12})?(Z|[+-][0-9][0-9]:[0-9][0-9])$/
   ).datetime({ offset: true }).describe(
-    "Read only. Timestamp when the chat message is created (initial setting) or modified, including when a reaction is added or removed."
+    "Read-only. Timestamp when the chat message is created (initial setting) or modified, including when a reaction is added or removed."
   ).nullish(),
   body: microsoft_graph_itemBody.optional(),
   subject: z.string().describe("The subject of the chat message, in plaintext.").nullish(),
@@ -385,14 +385,14 @@ const microsoft_graph_targetedChatMessage = z.object({
   deletedDateTime: z.string().regex(
     /^[0-9]{4,}-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{1,12})?(Z|[+-][0-9][0-9]:[0-9][0-9])$/
   ).datetime({ offset: true }).describe(
-    "Read only. Timestamp at which the chat message was deleted, or null if not deleted."
+    "Read-only. Timestamp at which the chat message was deleted, or null if not deleted."
   ).nullish(),
   etag: z.string().describe("Read-only. Version number of the chat message.").nullish(),
   eventDetail: microsoft_graph_eventMessageDetail.optional(),
   lastEditedDateTime: z.string().regex(
     /^[0-9]{4,}-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{1,12})?(Z|[+-][0-9][0-9]:[0-9][0-9])$/
   ).datetime({ offset: true }).describe(
-    "Read only. Timestamp when edits to the chat message were made. Triggers an 'Edited' flag in the Teams UI. If no edits are made the value is null."
+    "Read-only. Timestamp when edits to the chat message were made. Triggers an 'Edited' flag in the Teams UI. If no edits are made the value is null."
   ).nullish(),
   locale: z.string().describe("Locale of the chat message set by the client. Always set to en-us.").optional(),
   mentions: z.array(microsoft_graph_chatMessageMention).describe(
@@ -448,7 +448,9 @@ const microsoft_graph_chat = z.object({
   permissionGrants: z.array(microsoft_graph_resourceSpecificPermissionGrant).describe("A collection of permissions granted to apps for the chat.").optional(),
   pinnedMessages: z.array(microsoft_graph_pinnedChatMessageInfo).describe("A collection of all the pinned messages in the chat. Nullable.").optional(),
   tabs: z.array(microsoft_graph_teamsTab).describe("A collection of all the tabs in the chat. Nullable.").optional(),
-  targetedMessages: z.array(microsoft_graph_targetedChatMessage).optional()
+  targetedMessages: z.array(microsoft_graph_targetedChatMessage).describe(
+    "A collection of targeted messages in the chat that are visible only to specific users. Nullable. You can't expand this relationship using $expand. Targeted messages can also be retrieved via the userTeamwork: getAllTargetedMessages API."
+  ).optional()
 }).passthrough();
 const microsoft_graph_ODataErrors_ErrorDetails = z.object({ code: z.string(), message: z.string(), target: z.string().nullish() }).passthrough();
 const microsoft_graph_ODataErrors_InnerError = z.object({
@@ -535,10 +537,10 @@ const microsoft_graph_userWorkLocation = z.object({
 const microsoft_graph_presence = z.object({
   id: z.string().describe("The unique identifier for an entity. Read-only.").optional(),
   activity: z.string().describe(
-    "The supplemental information to a user's availability. Possible values are available, away, beRightBack, busy, doNotDisturb, offline, outOfOffice, presenceUnknown."
+    "The supplemental information to a user's availability. Possible values are Available, Away, BeRightBack, Busy, DoNotDisturb, Offline, OutOfOffice, PresenceUnknown."
   ).nullish(),
   availability: z.string().describe(
-    "The base presence information for a user. Possible values are available, away, beRightBack, busy, doNotDisturb, focusing, inACall, inAMeeting, offline, presenting, presenceUnknown."
+    "The base presence information for a user. Possible values are Available, Away, BeRightBack, Busy, DoNotDisturb, Focusing, InACall, InAMeeting, Offline, Presenting, PresenceUnknown."
   ).nullish(),
   outOfOfficeSettings: microsoft_graph_outOfOfficeSettings.optional(),
   sequenceNumber: z.string().describe(
@@ -675,7 +677,7 @@ const microsoft_graph_user = z.object({
     "The state or province in the user's address. Maximum length is 128 characters. Requires $select to retrieve. Supports $filter (eq, ne, not, ge, le, in, startsWith, and eq on null values)."
   ).nullish(),
   userPrincipalName: z.string().describe(
-    "The user principal name (UPN) of the user. The UPN is an Internet-style sign-in name for the user based on the Internet standard RFC 822. By convention, this value should map to the user's email name. The general format is alias@domain, where the domain must be present in the tenant's collection of verified domains. This property is required when a user is created. The verified domains for the tenant can be accessed from the verifiedDomains property of organization.NOTE: This property can't contain accent characters. Only the following characters are allowed A - Z, a - z, 0 - 9, ' . - _ ! # ^ ~. For the complete list of allowed characters, see username policies. Returned by default. Supports $filter (eq, ne, not, ge, le, in, startsWith, endsWith) and $orderby."
+    "The user principal name (UPN) of the user. The UPN is an Internet-style sign-in name for the user based on the Internet standard RFC 822. By convention, this value should map to the user's email name. The general format is alias@domain, where the domain must be present in the tenant's collection of verified domains. This property is required when a user is created. The verified domains for the tenant can be accessed from the verifiedDomains property of organization.NOTE: This property can't contain accent characters. Only the following characters are allowed A - Z, a - z, 0 - 9, ' . - _ ! # ^ ~. For the complete list of allowed characters, see username policies. Returned by default. Supports $filter (eq, ne, not, ge, le, in, startsWith, endsWith) and $orderby. This property is subject to sensitive action restrictions; only specific privileged administrator roles can update it."
   ).nullish(),
   deletedDateTime: z.string().regex(
     /^[0-9]{4,}-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{1,12})?(Z|[+-][0-9][0-9]:[0-9][0-9])$/
@@ -686,7 +688,7 @@ const microsoft_graph_user = z.object({
     "A freeform text entry field for the user to describe themselves. Requires $select to retrieve."
   ).nullish(),
   accountEnabled: z.boolean().describe(
-    "true if the account is enabled; otherwise, false. This property is required when a user is created. Requires $select to retrieve. Supports $filter (eq, ne, not, and in)."
+    "true if the account is enabled; otherwise, false. This property is required when a user is created. Requires $select to retrieve. Supports $filter (eq, ne, not, and in). This property is subject to sensitive action restrictions; only specific privileged administrator roles can update it."
   ).nullish(),
   ageGroup: z.string().describe(
     "Sets the age group of the user. Allowed values: null, Minor, NotAdult, and Adult. For more information, see legal age group property definitions. Requires $select to retrieve. Supports $filter (eq, ne, not, and in)."
@@ -704,7 +706,7 @@ const microsoft_graph_user = z.object({
     "The birthday of the user. The Timestamp type represents date and time information using ISO 8601 format and is always in UTC. For example, midnight UTC on Jan 1, 2014, is 2014-01-01T00:00:00Z. Requires $select to retrieve."
   ).optional(),
   businessPhones: z.array(z.string()).describe(
-    "The telephone numbers for the user. NOTE: Although it's a string collection, only one number can be set for this property. Read-only for users synced from the on-premises directory. Returned by default. Supports $filter (eq, not, ge, le, startsWith)."
+    "The telephone numbers for the user. NOTE: Although it's a string collection, only one number can be set for this property. Read-only for users synced from the on-premises directory. Returned by default. Supports $filter (eq, not, ge, le, startsWith). This property is subject to sensitive action restrictions; only specific privileged administrator roles can update it."
   ).optional(),
   city: z.string().describe(
     "The city where the user is located. Maximum length is 128 characters. Requires $select to retrieve. Supports $filter (eq, ne, not, ge, le, in, startsWith, and eq on null values)."
@@ -844,8 +846,8 @@ const microsoft_graph_driveItem = z.object({
   webUrl: z.string().describe(
     "URL that either displays the resource in the browser (for Office file formats), or is a direct link to the file (for other formats). Read-only."
   ).nullish(),
-  createdByUser: microsoft_graph_user.describe("[Note: Simplified from 136 properties to 25 most common ones]").optional(),
-  lastModifiedByUser: microsoft_graph_user.describe("[Note: Simplified from 136 properties to 25 most common ones]").optional(),
+  createdByUser: microsoft_graph_user.describe("[Note: Simplified from 138 properties to 25 most common ones]").optional(),
+  lastModifiedByUser: microsoft_graph_user.describe("[Note: Simplified from 138 properties to 25 most common ones]").optional(),
   audio: microsoft_graph_audio.optional(),
   bundle: microsoft_graph_bundle.optional(),
   cTag: z.string().describe(
@@ -1578,6 +1580,13 @@ const microsoft_graph_workbookRange = z.object({
   worksheet: microsoft_graph_workbookWorksheet.optional()
 }).passthrough();
 const create_excel_table_Body = z.object({ address: z.string().nullable(), hasHeaders: z.boolean().default(false) }).partial().passthrough();
+const microsoft_graph_groupAccessType = z.enum([
+  "none",
+  "private",
+  "secret",
+  "public",
+  "unknownFutureValue"
+]);
 const microsoft_graph_assignedLabel = z.object({
   displayName: z.string().describe("The display name of the label. Read-only.").nullish(),
   labelId: z.string().describe("The unique identifier of the label.").nullish()
@@ -1601,11 +1610,12 @@ const microsoft_graph_group = z.object({
   ).datetime({ offset: true }).describe(
     "Date and time when this object was deleted. Always null when the object hasn't been deleted."
   ).nullish(),
+  accessType: microsoft_graph_groupAccessType.optional(),
   allowExternalSenders: z.boolean().describe(
     "Indicates if people external to the organization can send messages to the group. The default value is false. Requires $select to retrieve. Supported only on the Get group API (GET /groups/{ID})."
   ).nullish(),
   assignedLabels: z.array(microsoft_graph_assignedLabel).describe(
-    "The list of sensitivity label pairs (label ID, label name) associated with a Microsoft 365 group. Requires $select to retrieve. This property can be updated only in delegated scenarios where the caller requires both the Microsoft Graph permission and a supported administrator role."
+    "The list of sensitivity label pairs (label ID, label name) associated with a Microsoft 365 group or a cloud security group. Requires a Microsoft Entra ID P1 license. Requires $select to retrieve. This property can be specified during group creation or update. However, for cloud security groups, it's immutable once set. This property can be updated only in delegated scenarios where the caller requires both the Microsoft Graph permission and a supported administrator role. To learn more about managing this property for Microsoft 365 vs. cloud security groups, see Key differences from Microsoft 365 group labeling."
   ).optional(),
   assignedLicenses: z.array(microsoft_graph_assignedLicense).describe(
     "The licenses that are assigned to the group. Requires $select to retrieve. Supports $filter (eq). Read-only."
@@ -1640,6 +1650,9 @@ const microsoft_graph_group = z.object({
   isAssignableToRole: z.boolean().describe(
     "Indicates whether this group can be assigned to a Microsoft Entra role. Optional. This property can only be set while creating the group and is immutable. If set to true, the securityEnabled property must also be set to true, visibility must be Hidden, and the group can't be a dynamic group (that is, groupTypes can't contain DynamicMembership). Only callers with at least the Privileged Role Administrator role can set this property. The caller must also be assigned the RoleManagement.ReadWrite.Directory permission to set this property or update the membership of such groups. For more, see Using a group to manage Microsoft Entra role assignmentsUsing this feature requires a Microsoft Entra ID P1 license. Returned by default. Supports $filter (eq, ne, not)."
   ).nullish(),
+  isFavorite: z.boolean().describe(
+    "Indicates whether the user marked the group as favorite. Requires $select to retrieve. Supported only on the Get group API (GET /groups/{ID})."
+  ).nullish(),
   isManagementRestricted: z.boolean().describe(
     "Indicates whether the group is a member of a restricted management administrative unit. If not set, the default value is null and the default behavior is false. Read-only.  To manage a group member of a restricted management administrative unit, the administrator or calling app must be assigned a Microsoft Entra role at the scope of the restricted management administrative unit. Requires $select to retrieve."
   ).nullish(),
@@ -1652,12 +1665,6 @@ const microsoft_graph_group = z.object({
   ).nullish(),
   mailEnabled: z.boolean().describe(
     "Specifies whether the group is mail-enabled. Required. Returned by default. Supports $filter (eq, ne, not)."
-  ).nullish(),
-  mailNickname: z.string().describe(
-    "The mail alias for the group, unique for Microsoft 365 groups in the organization. Maximum length is 64 characters. This property can contain only characters in the ASCII character set 0 - 127 except the following characters: @ () / [] ' ; : <> , SPACE. Required. Returned by default. Supports $filter (eq, ne, not, ge, le, in, startsWith, and eq on null values)."
-  ).nullish(),
-  membershipRule: z.string().describe(
-    "The rule that determines members for this group if the group is a dynamic group (groupTypes contains DynamicMembership). For more information about the syntax of the membership rule, see Membership Rules syntax. Returned by default. Supports $filter (eq, ne, not, ge, le, startsWith)."
   ).nullish()
 }).passthrough().passthrough();
 const microsoft_graph_groupCollectionResponse = z.object({
@@ -2579,8 +2586,8 @@ const microsoft_graph_listItem = z.object({
   webUrl: z.string().describe(
     "URL that either displays the resource in the browser (for Office file formats), or is a direct link to the file (for other formats). Read-only."
   ).nullish(),
-  createdByUser: microsoft_graph_user.describe("[Note: Simplified from 136 properties to 25 most common ones]").optional(),
-  lastModifiedByUser: microsoft_graph_user.describe("[Note: Simplified from 136 properties to 25 most common ones]").optional(),
+  createdByUser: microsoft_graph_user.describe("[Note: Simplified from 138 properties to 25 most common ones]").optional(),
+  lastModifiedByUser: microsoft_graph_user.describe("[Note: Simplified from 138 properties to 25 most common ones]").optional(),
   contentType: microsoft_graph_contentTypeInfo.optional(),
   deleted: microsoft_graph_deleted.optional(),
   sharepointIds: microsoft_graph_sharepointIds.optional(),
@@ -2588,6 +2595,7 @@ const microsoft_graph_listItem = z.object({
   documentSetVersions: z.array(microsoft_graph_documentSetVersion).describe("Version information for a document set version created by a user.").optional(),
   driveItem: microsoft_graph_driveItem.describe("[Note: Simplified from 45 properties to 25 most common ones]").optional(),
   fields: microsoft_graph_fieldValueSet.optional(),
+  permissions: z.array(microsoft_graph_permission).describe("The set of permissions for the item. Read-only. Nullable.").optional(),
   versions: z.array(microsoft_graph_listItemVersion).describe("The list of previous versions of the list item.").optional()
 }).passthrough();
 const microsoft_graph_longRunningOperationStatus = z.enum([
@@ -2680,7 +2688,16 @@ const microsoft_graph_subscription = z.object({
   ).nullish(),
   resource: z.string().describe(
     "Required. Specifies the resource that is monitored for changes. Don't include the base URL (https://graph.microsoft.com/v1.0/). See the possible resource path values for each supported resource."
-  ).optional()
+  ).optional(),
+  vapidPublicKey: z.string().describe(
+    "Optional. The application server's VAPID public key, base64url-encoded (P-256 uncompressed point, 65 bytes pre-encoding). Obtained by calling the getVapidPublicKey function on the subscription collection. The browser passes this value to PushManager.subscribe({ applicationServerKey: vapidPublicKey }) to bind the push subscription to this server identity. Required when notificationUrl targets a known Web Push service origin (for example, *.push.apple.com, fcm.googleapis.com, updates.push.services.mozilla.com); rejected with 400 Bad Request if supplied on a standard webhook subscription. For more information, see RFC 8292."
+  ).nullish(),
+  webPushEncryptionP256dhPublicKey: z.string().describe(
+    "Optional. The subscriber's ECDH public key, base64url-encoded (P-256 uncompressed point, 65 bytes pre-encoding). Obtained from the browser via PushSubscription.getKey('p256dh'). Used as the peer public key during ECDH key agreement to derive the per-message content encryption key for RFC 8291 payload encryption. Required when notificationUrl targets a known Web Push service origin; rejected with 400 Bad Request if supplied on a standard webhook subscription. For more information, see RFC 8291 Section 3."
+  ).nullish(),
+  webPushEncryptionSecret: z.string().describe(
+    "Optional. The subscriber's auth secret, base64url-encoded (16 bytes pre-encoding). Obtained from the browser via PushSubscription.getKey('auth'). Used as the HMAC-SHA-256 salt for the HKDF combine step that derives key material for RFC 8291 payload encryption. Write-only: this value is never returned in GET responses (returned as null). Treat as a secret. Required when notificationUrl targets a known Web Push service origin; rejected with 400 Bad Request if supplied on a standard webhook subscription. For more information, see RFC 8291 Section 3."
+  ).nullish()
 }).passthrough();
 const microsoft_graph_list = z.lazy(
   () => z.object({
@@ -2700,8 +2717,8 @@ const microsoft_graph_list = z.lazy(
     webUrl: z.string().describe(
       "URL that either displays the resource in the browser (for Office file formats), or is a direct link to the file (for other formats). Read-only."
     ).nullish(),
-    createdByUser: microsoft_graph_user.describe("[Note: Simplified from 136 properties to 25 most common ones]").optional(),
-    lastModifiedByUser: microsoft_graph_user.describe("[Note: Simplified from 136 properties to 25 most common ones]").optional(),
+    createdByUser: microsoft_graph_user.describe("[Note: Simplified from 138 properties to 25 most common ones]").optional(),
+    lastModifiedByUser: microsoft_graph_user.describe("[Note: Simplified from 138 properties to 25 most common ones]").optional(),
     displayName: z.string().describe("The displayable title of the list.").nullish(),
     list: microsoft_graph_listInfo.optional(),
     sharepointIds: microsoft_graph_sharepointIds.optional(),
@@ -2711,6 +2728,7 @@ const microsoft_graph_list = z.lazy(
     drive: microsoft_graph_drive.optional(),
     items: z.array(microsoft_graph_listItem).describe("All items contained in the list.").optional(),
     operations: z.array(microsoft_graph_richLongRunningOperation).describe("The collection of long-running operations on the list.").optional(),
+    permissions: z.array(microsoft_graph_permission).describe("The set of permissions for the item. Read-only. Nullable.").optional(),
     subscriptions: z.array(microsoft_graph_subscription).describe("The set of subscriptions on the list.").optional()
   }).passthrough()
 );
@@ -2732,8 +2750,8 @@ const microsoft_graph_drive = z.lazy(
     webUrl: z.string().describe(
       "URL that either displays the resource in the browser (for Office file formats), or is a direct link to the file (for other formats). Read-only."
     ).nullish(),
-    createdByUser: microsoft_graph_user.describe("[Note: Simplified from 136 properties to 25 most common ones]").optional(),
-    lastModifiedByUser: microsoft_graph_user.describe("[Note: Simplified from 136 properties to 25 most common ones]").optional(),
+    createdByUser: microsoft_graph_user.describe("[Note: Simplified from 138 properties to 25 most common ones]").optional(),
+    lastModifiedByUser: microsoft_graph_user.describe("[Note: Simplified from 138 properties to 25 most common ones]").optional(),
     driveType: z.string().describe(
       "Describes the type of drive represented by this resource. OneDrive personal drives return personal. OneDrive for Business returns business. SharePoint document libraries return documentLibrary. Read-only."
     ).nullish(),
@@ -2895,7 +2913,7 @@ const microsoft_graph_channel = z.lazy(
     id: z.string().describe("The unique identifier for an entity. Read-only.").optional(),
     createdDateTime: z.string().regex(
       /^[0-9]{4,}-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{1,12})?(Z|[+-][0-9][0-9]:[0-9][0-9])$/
-    ).datetime({ offset: true }).describe("Read only. Timestamp at which the channel was created.").nullish(),
+    ).datetime({ offset: true }).describe("Read-only. Timestamp at which the channel was created.").nullish(),
     description: z.string().describe("Optional textual description for the channel.").nullish(),
     displayName: z.string().describe(
       "Channel name as it will appear to the user in Microsoft Teams. The maximum length is 50 characters."
@@ -3007,7 +3025,7 @@ const microsoft_graph_team = z.lazy(
     ).nullish(),
     allChannels: z.array(microsoft_graph_channel).describe("List of channels either hosted in or shared with the team (incoming channels).").optional(),
     channels: z.array(microsoft_graph_channel).describe("The collection of channels and messages associated with the team.").optional(),
-    group: microsoft_graph_group.describe("[Note: Simplified from 75 properties to 25 most common ones]").optional(),
+    group: microsoft_graph_group.describe("[Note: Simplified from 81 properties to 25 most common ones]").optional(),
     incomingChannels: z.array(microsoft_graph_channel).describe("List of channels shared with the team.").optional(),
     installedApps: z.array(microsoft_graph_teamsAppInstallation).describe("The apps installed in this team.").optional(),
     members: z.array(microsoft_graph_conversationMember).describe("Members and owners of the team.").optional(),
@@ -3579,6 +3597,13 @@ const microsoft_graph_chatInfo = z.object({
 const microsoft_graph_chatRestrictions = z.object({
   allowTextOnly: z.boolean().describe("Indicates whether only text is allowed in the meeting chat. Optional.").nullish()
 }).passthrough();
+const microsoft_graph_cloudVideoInteropInfo = z.object({
+  moreInfoWebUrl: z.string().describe("Provides other video teleconferencing (VTC) dial-in options. Read-only.").nullish(),
+  tenantKey: z.string().describe(
+    "The tenant key that is used to dial into the interactive voice response (IVR) of the partner CVI service."
+  ).nullish(),
+  videoTeleconferenceId: z.string().describe("The video teleconferencing ID. Read-only.").nullish()
+}).passthrough();
 const microsoft_graph_joinMeetingIdSettings = z.object({
   isPasscodeRequired: z.boolean().describe(
     "Indicates whether a passcode is required to join a meeting when using joinMeetingId. Optional."
@@ -3610,6 +3635,7 @@ const microsoft_graph_onlineMeeting = z.object({
   audioConferencing: microsoft_graph_audioConferencing.optional(),
   chatInfo: microsoft_graph_chatInfo.optional(),
   chatRestrictions: microsoft_graph_chatRestrictions.optional(),
+  cloudVideoInteropInfo: microsoft_graph_cloudVideoInteropInfo.optional(),
   expiryDateTime: z.string().regex(
     /^[0-9]{4,}-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{1,12})?(Z|[+-][0-9][0-9]:[0-9][0-9])$/
   ).datetime({ offset: true }).describe(
@@ -3618,8 +3644,7 @@ const microsoft_graph_onlineMeeting = z.object({
   isEndToEndEncryptionEnabled: z.boolean().describe("Indicates whether end-to-end encryption (E2EE) is enabled for the online meeting.").nullish(),
   isEntryExitAnnounced: z.boolean().describe("Indicates whether to announce when callers join or leave.").nullish(),
   joinInformation: microsoft_graph_itemBody.optional(),
-  joinMeetingIdSettings: microsoft_graph_joinMeetingIdSettings.optional(),
-  joinWebUrl: z.string().describe("The join URL of the online meeting. Read-only.").nullish()
+  joinMeetingIdSettings: microsoft_graph_joinMeetingIdSettings.optional()
 }).passthrough().passthrough();
 const microsoft_graph_onlineMeetingCollectionResponse = z.object({
   "@odata.count": z.number().int().nullable(),
@@ -4155,6 +4180,7 @@ const microsoft_graph_place = z.object({
   label: z.string().describe("User-defined description of the place.").nullish(),
   parentId: z.string().describe("The ID of a parent place.").nullish(),
   phone: z.string().describe("The phone number of the place.").nullish(),
+  placeId: z.string().describe("A stable service-level identifier for the place object used by Places workloads.").nullish(),
   tags: z.array(z.string()).describe("Custom tags that are associated with the place for categorization or filtering.").optional(),
   checkIns: z.array(microsoft_graph_checkInClaim).describe(
     "A subresource of a place object that indicates the check-in status of an Outlook calendar event booked at the place."
@@ -4176,6 +4202,7 @@ const microsoft_graph_room = z.object({
   label: z.string().describe("User-defined description of the place.").nullish(),
   parentId: z.string().describe("The ID of a parent place.").nullish(),
   phone: z.string().describe("The phone number of the place.").nullish(),
+  placeId: z.string().describe("A stable service-level identifier for the place object used by Places workloads.").nullish(),
   tags: z.array(z.string()).describe("Custom tags that are associated with the place for categorization or filtering.").optional(),
   checkIns: z.array(microsoft_graph_checkInClaim).describe(
     "A subresource of a place object that indicates the check-in status of an Outlook calendar event booked at the place."
@@ -4189,7 +4216,6 @@ const microsoft_graph_room = z.object({
   floorLabel: z.string().describe("Specifies a descriptive label for the floor, for example, P.").nullish(),
   floorNumber: z.number().gte(-2147483648).lte(2147483647).describe("Specifies the floor number that the room is on.").nullish(),
   nickname: z.string().describe("Specifies a nickname for the room, for example, 'conf room'.").optional(),
-  placeId: z.string().describe("An alternative immutable unique identifier of the room. Read-only.").nullish(),
   teamsEnabledState: microsoft_graph_placeFeatureEnablement.optional(),
   videoDeviceName: z.string().describe("Specifies the name of the video device in the room.").nullish()
 }).passthrough();
@@ -4203,6 +4229,7 @@ const microsoft_graph_workspace = z.object({
   label: z.string().describe("User-defined description of the place.").nullish(),
   parentId: z.string().describe("The ID of a parent place.").nullish(),
   phone: z.string().describe("The phone number of the place.").nullish(),
+  placeId: z.string().describe("A stable service-level identifier for the place object used by Places workloads.").nullish(),
   tags: z.array(z.string()).describe("Custom tags that are associated with the place for categorization or filtering.").optional(),
   checkIns: z.array(microsoft_graph_checkInClaim).describe(
     "A subresource of a place object that indicates the check-in status of an Outlook calendar event booked at the place."
@@ -4217,8 +4244,7 @@ const microsoft_graph_workspace = z.object({
   mode: microsoft_graph_placeMode.optional(),
   nickname: z.string().describe(
     "A short, friendly name for the workspace, often used for easier identification or display in the UI."
-  ).optional(),
-  placeId: z.string().describe("An alternative immutable unique identifier of the workspace. Read-only.").nullish()
+  ).optional()
 }).passthrough();
 const microsoft_graph_roomList = z.object({
   id: z.string().describe("The unique identifier for an entity. Read-only.").optional(),
@@ -4229,6 +4255,7 @@ const microsoft_graph_roomList = z.object({
   label: z.string().describe("User-defined description of the place.").nullish(),
   parentId: z.string().describe("The ID of a parent place.").nullish(),
   phone: z.string().describe("The phone number of the place.").nullish(),
+  placeId: z.string().describe("A stable service-level identifier for the place object used by Places workloads.").nullish(),
   tags: z.array(z.string()).describe("Custom tags that are associated with the place for categorization or filtering.").optional(),
   checkIns: z.array(microsoft_graph_checkInClaim).describe(
     "A subresource of a place object that indicates the check-in status of an Outlook calendar event booked at the place."
@@ -4540,8 +4567,8 @@ const microsoft_graph_baseItem = z.object({
   webUrl: z.string().describe(
     "URL that either displays the resource in the browser (for Office file formats), or is a direct link to the file (for other formats). Read-only."
   ).nullish(),
-  createdByUser: microsoft_graph_user.describe("[Note: Simplified from 136 properties to 25 most common ones]").optional(),
-  lastModifiedByUser: microsoft_graph_user.describe("[Note: Simplified from 136 properties to 25 most common ones]").optional()
+  createdByUser: microsoft_graph_user.describe("[Note: Simplified from 138 properties to 25 most common ones]").optional(),
+  lastModifiedByUser: microsoft_graph_user.describe("[Note: Simplified from 138 properties to 25 most common ones]").optional()
 }).passthrough();
 const microsoft_graph_site = z.object({
   id: z.string().describe("The unique identifier for an entity. Read-only.").optional(),
@@ -4562,8 +4589,8 @@ const microsoft_graph_site = z.object({
   webUrl: z.string().describe(
     "URL that either displays the resource in the browser (for Office file formats), or is a direct link to the file (for other formats). Read-only."
   ).nullish(),
-  createdByUser: microsoft_graph_user.describe("[Note: Simplified from 136 properties to 25 most common ones]").optional(),
-  lastModifiedByUser: microsoft_graph_user.describe("[Note: Simplified from 136 properties to 25 most common ones]").optional(),
+  createdByUser: microsoft_graph_user.describe("[Note: Simplified from 138 properties to 25 most common ones]").optional(),
+  lastModifiedByUser: microsoft_graph_user.describe("[Note: Simplified from 138 properties to 25 most common ones]").optional(),
   isPersonalSite: z.boolean().describe("Identifies whether the site is personal or not. Read-only.").nullish(),
   root: microsoft_graph_root.optional(),
   sharepointIds: microsoft_graph_sharepointIds.optional(),
@@ -4671,6 +4698,7 @@ const microsoft_graph_virtualEventSession = z.object({
   audioConferencing: microsoft_graph_audioConferencing.optional(),
   chatInfo: microsoft_graph_chatInfo.optional(),
   chatRestrictions: microsoft_graph_chatRestrictions.optional(),
+  cloudVideoInteropInfo: microsoft_graph_cloudVideoInteropInfo.optional(),
   expiryDateTime: z.string().regex(
     /^[0-9]{4,}-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{1,12})?(Z|[+-][0-9][0-9]:[0-9][0-9])$/
   ).datetime({ offset: true }).describe(
@@ -4679,8 +4707,7 @@ const microsoft_graph_virtualEventSession = z.object({
   isEndToEndEncryptionEnabled: z.boolean().describe("Indicates whether end-to-end encryption (E2EE) is enabled for the online meeting.").nullish(),
   isEntryExitAnnounced: z.boolean().describe("Indicates whether to announce when callers join or leave.").nullish(),
   joinInformation: microsoft_graph_itemBody.optional(),
-  joinMeetingIdSettings: microsoft_graph_joinMeetingIdSettings.optional(),
-  joinWebUrl: z.string().describe("The join URL of the online meeting. Read-only.").nullish()
+  joinMeetingIdSettings: microsoft_graph_joinMeetingIdSettings.optional()
 }).passthrough().passthrough();
 const microsoft_graph_meetingAudience = z.enum(["everyone", "organization", "unknownFutureValue"]);
 const microsoft_graph_communicationsUserIdentity = z.object({
@@ -4702,10 +4729,14 @@ const microsoft_graph_virtualEventRegistrationQuestionBase = z.object({
 const microsoft_graph_virtualEventWebinarRegistrationConfiguration = z.object({
   id: z.string().describe("The unique identifier for an entity. Read-only.").optional(),
   capacity: z.number().gte(-2147483648).lte(2147483647).describe("Total capacity of the virtual event.").nullish(),
+  isManualApprovalEnabled: z.boolean().describe(
+    "Indicates whether registrations require organizer approval before a participant is confirmed."
+  ).nullish(),
+  isWaitlistEnabled: z.boolean().describe(
+    "Indicates whether more registrants are automatically placed on a waitlist when capacity is reached."
+  ).nullish(),
   registrationWebUrl: z.string().describe("Registration URL of the virtual event.").nullish(),
-  questions: z.array(microsoft_graph_virtualEventRegistrationQuestionBase).describe("Registration questions.").optional(),
-  isManualApprovalEnabled: z.boolean().nullish(),
-  isWaitlistEnabled: z.boolean().nullish()
+  questions: z.array(microsoft_graph_virtualEventRegistrationQuestionBase).describe("Registration questions.").optional()
 }).passthrough();
 const microsoft_graph_virtualEventRegistrationQuestionAnswer = z.object({
   booleanValue: z.boolean().describe(
@@ -4762,6 +4793,7 @@ const microsoft_graph_virtualEventWebinar = z.object({
   externalEventInformation: z.array(microsoft_graph_virtualEventExternalInformation).describe(
     "The external information of a virtual event. Returned only for event organizers or coorganizers; otherwise, null."
   ).optional(),
+  isRegistrationRequired: z.boolean().describe("Indicates whether attendee registration is enabled for the virtual event.").nullish(),
   settings: microsoft_graph_virtualEventSettings.optional(),
   startDateTime: microsoft_graph_dateTimeTimeZone.optional(),
   status: microsoft_graph_virtualEventStatus.optional(),
@@ -4973,6 +5005,7 @@ const schemas = {
   microsoft_graph_workbookRangeFormat,
   microsoft_graph_workbookRange,
   create_excel_table_Body,
+  microsoft_graph_groupAccessType,
   microsoft_graph_assignedLabel,
   microsoft_graph_licenseProcessingState,
   microsoft_graph_group,
@@ -5168,6 +5201,7 @@ const schemas = {
   microsoft_graph_audioConferencing,
   microsoft_graph_chatInfo,
   microsoft_graph_chatRestrictions,
+  microsoft_graph_cloudVideoInteropInfo,
   microsoft_graph_joinMeetingIdSettings,
   microsoft_graph_onlineMeeting,
   microsoft_graph_onlineMeetingCollectionResponse,
@@ -5802,8 +5836,8 @@ const endpoints = makeApi([
           webUrl: z.string().describe(
             "URL that either displays the resource in the browser (for Office file formats), or is a direct link to the file (for other formats). Read-only."
           ).nullish(),
-          createdByUser: microsoft_graph_user.describe("[Note: Simplified from 136 properties to 25 most common ones]").optional(),
-          lastModifiedByUser: microsoft_graph_user.describe("[Note: Simplified from 136 properties to 25 most common ones]").optional(),
+          createdByUser: microsoft_graph_user.describe("[Note: Simplified from 138 properties to 25 most common ones]").optional(),
+          lastModifiedByUser: microsoft_graph_user.describe("[Note: Simplified from 138 properties to 25 most common ones]").optional(),
           audio: microsoft_graph_audio.optional(),
           bundle: microsoft_graph_bundle.optional(),
           cTag: z.string().describe(
@@ -5917,8 +5951,8 @@ const endpoints = makeApi([
           webUrl: z.string().describe(
             "URL that either displays the resource in the browser (for Office file formats), or is a direct link to the file (for other formats). Read-only."
           ).nullish(),
-          createdByUser: microsoft_graph_user.describe("[Note: Simplified from 136 properties to 25 most common ones]").optional(),
-          lastModifiedByUser: microsoft_graph_user.describe("[Note: Simplified from 136 properties to 25 most common ones]").optional(),
+          createdByUser: microsoft_graph_user.describe("[Note: Simplified from 138 properties to 25 most common ones]").optional(),
+          lastModifiedByUser: microsoft_graph_user.describe("[Note: Simplified from 138 properties to 25 most common ones]").optional(),
           audio: microsoft_graph_audio.optional(),
           bundle: microsoft_graph_bundle.optional(),
           cTag: z.string().describe(
@@ -6860,11 +6894,12 @@ You can search within a folder hierarchy, a whole drive, or files shared with th
           ).datetime({ offset: true }).describe(
             "Date and time when this object was deleted. Always null when the object hasn't been deleted."
           ).nullish(),
+          accessType: microsoft_graph_groupAccessType.optional(),
           allowExternalSenders: z.boolean().describe(
             "Indicates if people external to the organization can send messages to the group. The default value is false. Requires $select to retrieve. Supported only on the Get group API (GET /groups/{ID})."
           ).nullish(),
           assignedLabels: z.array(microsoft_graph_assignedLabel).describe(
-            "The list of sensitivity label pairs (label ID, label name) associated with a Microsoft 365 group. Requires $select to retrieve. This property can be updated only in delegated scenarios where the caller requires both the Microsoft Graph permission and a supported administrator role."
+            "The list of sensitivity label pairs (label ID, label name) associated with a Microsoft 365 group or a cloud security group. Requires a Microsoft Entra ID P1 license. Requires $select to retrieve. This property can be specified during group creation or update. However, for cloud security groups, it's immutable once set. This property can be updated only in delegated scenarios where the caller requires both the Microsoft Graph permission and a supported administrator role. To learn more about managing this property for Microsoft 365 vs. cloud security groups, see Key differences from Microsoft 365 group labeling."
           ).optional(),
           assignedLicenses: z.array(microsoft_graph_assignedLicense).describe(
             "The licenses that are assigned to the group. Requires $select to retrieve. Supports $filter (eq). Read-only."
@@ -6899,6 +6934,9 @@ You can search within a folder hierarchy, a whole drive, or files shared with th
           isAssignableToRole: z.boolean().describe(
             "Indicates whether this group can be assigned to a Microsoft Entra role. Optional. This property can only be set while creating the group and is immutable. If set to true, the securityEnabled property must also be set to true, visibility must be Hidden, and the group can't be a dynamic group (that is, groupTypes can't contain DynamicMembership). Only callers with at least the Privileged Role Administrator role can set this property. The caller must also be assigned the RoleManagement.ReadWrite.Directory permission to set this property or update the membership of such groups. For more, see Using a group to manage Microsoft Entra role assignmentsUsing this feature requires a Microsoft Entra ID P1 license. Returned by default. Supports $filter (eq, ne, not)."
           ).nullish(),
+          isFavorite: z.boolean().describe(
+            "Indicates whether the user marked the group as favorite. Requires $select to retrieve. Supported only on the Get group API (GET /groups/{ID})."
+          ).nullish(),
           isManagementRestricted: z.boolean().describe(
             "Indicates whether the group is a member of a restricted management administrative unit. If not set, the default value is null and the default behavior is false. Read-only.  To manage a group member of a restricted management administrative unit, the administrator or calling app must be assigned a Microsoft Entra role at the scope of the restricted management administrative unit. Requires $select to retrieve."
           ).nullish(),
@@ -6911,12 +6949,6 @@ You can search within a folder hierarchy, a whole drive, or files shared with th
           ).nullish(),
           mailEnabled: z.boolean().describe(
             "Specifies whether the group is mail-enabled. Required. Returned by default. Supports $filter (eq, ne, not)."
-          ).nullish(),
-          mailNickname: z.string().describe(
-            "The mail alias for the group, unique for Microsoft 365 groups in the organization. Maximum length is 64 characters. This property can contain only characters in the ASCII character set 0 - 127 except the following characters: @ () / [] ' ; : <> , SPACE. Required. Returned by default. Supports $filter (eq, ne, not, ge, le, in, startsWith, and eq on null values)."
-          ).nullish(),
-          membershipRule: z.string().describe(
-            "The rule that determines members for this group if the group is a dynamic group (groupTypes contains DynamicMembership). For more information about the syntax of the membership rule, see Membership Rules syntax. Returned by default. Supports $filter (eq, ne, not, ge, le, startsWith)."
           ).nullish()
         }).passthrough().passthrough()
       }
@@ -6973,11 +7005,12 @@ You can create or update the following types of group: By default, this operatio
           ).datetime({ offset: true }).describe(
             "Date and time when this object was deleted. Always null when the object hasn't been deleted."
           ).nullish(),
+          accessType: microsoft_graph_groupAccessType.optional(),
           allowExternalSenders: z.boolean().describe(
             "Indicates if people external to the organization can send messages to the group. The default value is false. Requires $select to retrieve. Supported only on the Get group API (GET /groups/{ID})."
           ).nullish(),
           assignedLabels: z.array(microsoft_graph_assignedLabel).describe(
-            "The list of sensitivity label pairs (label ID, label name) associated with a Microsoft 365 group. Requires $select to retrieve. This property can be updated only in delegated scenarios where the caller requires both the Microsoft Graph permission and a supported administrator role."
+            "The list of sensitivity label pairs (label ID, label name) associated with a Microsoft 365 group or a cloud security group. Requires a Microsoft Entra ID P1 license. Requires $select to retrieve. This property can be specified during group creation or update. However, for cloud security groups, it's immutable once set. This property can be updated only in delegated scenarios where the caller requires both the Microsoft Graph permission and a supported administrator role. To learn more about managing this property for Microsoft 365 vs. cloud security groups, see Key differences from Microsoft 365 group labeling."
           ).optional(),
           assignedLicenses: z.array(microsoft_graph_assignedLicense).describe(
             "The licenses that are assigned to the group. Requires $select to retrieve. Supports $filter (eq). Read-only."
@@ -7012,6 +7045,9 @@ You can create or update the following types of group: By default, this operatio
           isAssignableToRole: z.boolean().describe(
             "Indicates whether this group can be assigned to a Microsoft Entra role. Optional. This property can only be set while creating the group and is immutable. If set to true, the securityEnabled property must also be set to true, visibility must be Hidden, and the group can't be a dynamic group (that is, groupTypes can't contain DynamicMembership). Only callers with at least the Privileged Role Administrator role can set this property. The caller must also be assigned the RoleManagement.ReadWrite.Directory permission to set this property or update the membership of such groups. For more, see Using a group to manage Microsoft Entra role assignmentsUsing this feature requires a Microsoft Entra ID P1 license. Returned by default. Supports $filter (eq, ne, not)."
           ).nullish(),
+          isFavorite: z.boolean().describe(
+            "Indicates whether the user marked the group as favorite. Requires $select to retrieve. Supported only on the Get group API (GET /groups/{ID})."
+          ).nullish(),
           isManagementRestricted: z.boolean().describe(
             "Indicates whether the group is a member of a restricted management administrative unit. If not set, the default value is null and the default behavior is false. Read-only.  To manage a group member of a restricted management administrative unit, the administrator or calling app must be assigned a Microsoft Entra role at the scope of the restricted management administrative unit. Requires $select to retrieve."
           ).nullish(),
@@ -7024,12 +7060,6 @@ You can create or update the following types of group: By default, this operatio
           ).nullish(),
           mailEnabled: z.boolean().describe(
             "Specifies whether the group is mail-enabled. Required. Returned by default. Supports $filter (eq, ne, not)."
-          ).nullish(),
-          mailNickname: z.string().describe(
-            "The mail alias for the group, unique for Microsoft 365 groups in the organization. Maximum length is 64 characters. This property can contain only characters in the ASCII character set 0 - 127 except the following characters: @ () / [] ' ; : <> , SPACE. Required. Returned by default. Supports $filter (eq, ne, not, ge, le, in, startsWith, and eq on null values)."
-          ).nullish(),
-          membershipRule: z.string().describe(
-            "The rule that determines members for this group if the group is a dynamic group (groupTypes contains DynamicMembership). For more information about the syntax of the membership rule, see Membership Rules syntax. Returned by default. Supports $filter (eq, ne, not, ge, le, startsWith)."
           ).nullish()
         }).passthrough().passthrough()
       }
@@ -9320,7 +9350,7 @@ be returned for more than one recipient at one time. The requested MailTips are 
     method: "get",
     path: "/me/inferenceClassification/overrides",
     alias: "list-focused-inbox-overrides",
-    description: `Get the overrides that a user has set up to always classify messages from certain senders in specific ways. Each override corresponds to an SMTP address of a sender. Initially, a user does not have any overrides.`,
+    description: `Get the overrides that a user has set up to always classify messages from certain senders in specific ways. Each override corresponds to an SMTP address of a sender. Initially, a user doesn't have any overrides.`,
     requestFormat: "json",
     parameters: [
       {
@@ -9555,7 +9585,7 @@ the new SMTP address is the only way to 'update' the override for this sender.`,
     method: "get",
     path: "/me/mailFolders",
     alias: "list-mail-folders",
-    description: `Get the mail folder collection directly under the root folder of the signed-in user. The returned collection includes any mail search folders directly under the root. By default, this operation does not return hidden folders. Use a query parameter includeHiddenFolders to include them in the response. This operation does not return all mail folders in a mailbox, only the child folders of the root folder. To return all mail folders in a mailbox, each child folder must be traversed separately.`,
+    description: `Get the mail folder collection directly under the root folder of the signed-in user. The returned collection includes any mail search folders directly under the root. By default, this operation doesn't return hidden folders. Use a query parameter includeHiddenFolders to include them in the response. This operation doesn't return all mail folders in a mailbox, only the child folders of the root folder. To return all mail folders in a mailbox, each child folder must be traversed separately.`,
     requestFormat: "json",
     parameters: [
       {
@@ -9658,7 +9688,7 @@ the new SMTP address is the only way to 'update' the override for this sender.`,
     path: "/me/mailFolders/:mailFolderId/childFolders",
     alias: "list-mail-child-folders",
     description: `Get the folder collection under the specified folder. You can use the .../me/mailFolders shortcut to get the top-level
-folder collection and navigate to another folder. By default, this operation does not return hidden folders. Use a query parameter includeHiddenFolders to include them in the response.`,
+folder collection and navigate to another folder. By default, this operation doesn't return hidden folders. Use a query parameter includeHiddenFolders to include them in the response.`,
     requestFormat: "json",
     parameters: [
       {
@@ -10989,6 +11019,7 @@ resource.`,
           audioConferencing: microsoft_graph_audioConferencing.optional(),
           chatInfo: microsoft_graph_chatInfo.optional(),
           chatRestrictions: microsoft_graph_chatRestrictions.optional(),
+          cloudVideoInteropInfo: microsoft_graph_cloudVideoInteropInfo.optional(),
           expiryDateTime: z.string().regex(
             /^[0-9]{4,}-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{1,12})?(Z|[+-][0-9][0-9]:[0-9][0-9])$/
           ).datetime({ offset: true }).describe(
@@ -10999,8 +11030,7 @@ resource.`,
           ).nullish(),
           isEntryExitAnnounced: z.boolean().describe("Indicates whether to announce when callers join or leave.").nullish(),
           joinInformation: microsoft_graph_itemBody.optional(),
-          joinMeetingIdSettings: microsoft_graph_joinMeetingIdSettings.optional(),
-          joinWebUrl: z.string().describe("The join URL of the online meeting. Read-only.").nullish()
+          joinMeetingIdSettings: microsoft_graph_joinMeetingIdSettings.optional()
         }).passthrough().passthrough()
       }
     ],
@@ -11061,6 +11091,7 @@ resource.`,
           audioConferencing: microsoft_graph_audioConferencing.optional(),
           chatInfo: microsoft_graph_chatInfo.optional(),
           chatRestrictions: microsoft_graph_chatRestrictions.optional(),
+          cloudVideoInteropInfo: microsoft_graph_cloudVideoInteropInfo.optional(),
           expiryDateTime: z.string().regex(
             /^[0-9]{4,}-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{1,12})?(Z|[+-][0-9][0-9]:[0-9][0-9])$/
           ).datetime({ offset: true }).describe(
@@ -11071,8 +11102,7 @@ resource.`,
           ).nullish(),
           isEntryExitAnnounced: z.boolean().describe("Indicates whether to announce when callers join or leave.").nullish(),
           joinInformation: microsoft_graph_itemBody.optional(),
-          joinMeetingIdSettings: microsoft_graph_joinMeetingIdSettings.optional(),
-          joinWebUrl: z.string().describe("The join URL of the online meeting. Read-only.").nullish()
+          joinMeetingIdSettings: microsoft_graph_joinMeetingIdSettings.optional()
         }).passthrough().passthrough()
       }
     ],

@@ -140,6 +140,8 @@ dist
 # Token cache files
 .token-cache.json
 .selected-account.json
+.cache-key
+*.migrated
 
 # Server logs (may contain PII and token metadata)
 logs/
@@ -147,6 +149,7 @@ logs/
 openapi
 
 src/generated/client.ts
+src/generated/client-beta.ts
 **/.claude/settings.local.json
 
 # Claude Code instructions file

@@ -1,8 +1,10 @@
 /** Shared context for MCP `initialize.instructions` (hosts that forward it to the model). */
 export type McpInstructionsContext = {
   orgMode: boolean;
+  appMode?: boolean;
   readOnly: boolean;
   multiAccount: boolean;
+  attachmentUrlsEnabled?: boolean;
 };
 
 function buildGeneralMcpInstructions(opts: McpInstructionsContext): string {
@@ -13,8 +15,16 @@ function buildGeneralMcpInstructions(opts: McpInstructionsContext): string {
     'When you need an organizational user or recipient address, resolve it with list-users (or another directory tool); do not invent SMTP addresses.',
     'Directory $search on collections such as /users or /groups requires ConsistencyLevel: eventual when the tool exposes that header.',
     'Teams chat and channel messages: prefer HTML contentType in the body; plain text is often mangled by Graph.',
-    'Files / binary content: for large drive/SharePoint file content, prefer get-download-url to resolve a pre-authenticated URL for out-of-band download. Use download-bytes for authenticated byte reads such as mail attachments, profile photos, Teams hosted content, and meeting recordings. Both tools take relative Microsoft Graph paths, not absolute URLs. For uploads, upload-file-content takes a base64 string body up to 4MB; use create-upload-session above that.',
+    'Files / binary content: for large drive/SharePoint file content, prefer get-download-url to resolve a pre-authenticated URL for out-of-band download.',
+    opts.attachmentUrlsEnabled
+      ? 'Attachment URLs are enabled: for document reading and downloads, prefer get-download-url for mail attachments, meeting recordings, drive files and other authenticated byte resources, then hand the URL to an external converter or downloader. Use download-bytes only when the caller explicitly needs bytes. Server-minted URLs are single-use: mint a fresh URL for every fetch, including probes, conversion, continuation and retries; retain the same target, account and document selection. This is a preference, not enforcement: enabling attachment URLs does not scrub arbitrary response bodies; use existing tool filtering when a text-only tool surface is required.'
+      : 'Use download-bytes for authenticated byte reads such as mail attachments, profile photos, Teams hosted content, and meeting recordings.',
+    'In stdio mode (or HTTP with --http-local-file-tools), download-bytes-to-file writes authenticated bytes straight to a local absolute path instead of returning base64. These tools take relative Microsoft Graph paths, not absolute URLs. For uploads, upload-file-content takes a base64 string body (Graph allows 250MB, but the whole string passes through the agent context and a truncated one is written without error); use create-upload-session for anything but small files.',
   ];
+  if (opts.appMode)
+    parts.push(
+      'App mode: there is no signed-in user, so /me paths do not work. Name the user in /users/{user-id} paths with a UPN or object id.'
+    );
   if (opts.readOnly) parts.push('This server is read-only; write operations are disabled.');
   if (opts.multiAccount)
     parts.push('Multiple accounts: pass the account parameter when required (see list-accounts).');
@@ -35,9 +45,12 @@ const DISCOVERY_MODE_INSTRUCTIONS_ADDON =
  * Full MCP `initialize.instructions` string: general guidance for every mode, plus a discovery-only suffix when applicable.
  */
 export function buildMcpServerInstructions(
-  opts: McpInstructionsContext & { discovery: boolean }
+  opts: McpInstructionsContext & { discovery: boolean; eagerTools?: string[] }
 ): string {
   const general = buildGeneralMcpInstructions(opts);
   if (!opts.discovery) return general;
-  return `${general} ${DISCOVERY_MODE_INSTRUCTIONS_ADDON}`;
+  const eager = opts.eagerTools?.length
+    ? ' HYBRID MODE: Tools published directly may be called immediately using their schemas. Use discovery for other operations; directly published tools also remain available through discovery.'
+    : '';
+  return `${general} ${DISCOVERY_MODE_INSTRUCTIONS_ADDON}${eager}`;
 }

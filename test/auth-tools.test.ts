@@ -36,7 +36,9 @@ describe('Auth Tools', () => {
     verifyLoginTool = vi.fn();
 
     server = {
-      tool: vi.fn((name, description, schema, handler) => {
+      // The handler is always the last argument; the annotations sit before it.
+      tool: vi.fn((name, ...args) => {
+        const handler = args.at(-1);
         if (name === 'login') {
           loginTool = handler;
         }
@@ -102,6 +104,7 @@ describe('Auth Tools', () => {
         .mockResolvedValueOnce({ success: false, message: 'Not logged in' })
         .mockResolvedValueOnce({
           success: true,
+          message: 'Login successful',
           userData: { displayName: 'Browser User' },
         });
 
@@ -109,8 +112,14 @@ describe('Auth Tools', () => {
 
       expect(authManager.acquireTokenInteractive).toHaveBeenCalled();
       expect(authManager.acquireTokenByDeviceCode).not.toHaveBeenCalled();
-      expect(result.content[0].text).toContain('Login successful');
-      expect(result.content[0].text).toContain('Browser authentication completed');
+      expect(result.content[0].text).toBe(
+        JSON.stringify({
+          status: 'Login successful',
+          success: true,
+          message: 'Login successful',
+          userData: { displayName: 'Browser User' },
+        })
+      );
     });
 
     it('should proceed with login when not already logged in', async () => {

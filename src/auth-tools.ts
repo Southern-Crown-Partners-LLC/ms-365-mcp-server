@@ -1,15 +1,52 @@
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import AuthManager from './auth.js';
+import logger from './logger.js';
 import { getRequestTokens } from './request-context.js';
 
-export function registerAuthTools(server: McpServer, authManager: AuthManager): void {
+export interface AuthToolsOptions {
+  /** --enabled-tools regex; applied to the account tools like to every other tool. */
+  enabledTools?: string;
+  /** --read-only: skip the account tools whose readOnlyHint is not true. */
+  readOnly?: boolean;
+}
+
+function readOnlyHintOf(args: unknown[]): boolean {
+  const annotations = args.find(
+    (arg): arg is { readOnlyHint?: boolean } =>
+      typeof arg === 'object' && arg !== null && 'readOnlyHint' in arg
+  );
+  return annotations?.readOnlyHint === true;
+}
+
+export function registerAuthTools(
+  mcpServer: McpServer,
+  authManager: AuthManager,
+  options: AuthToolsOptions = {}
+): void {
+  let enabledToolsRegex: RegExp | undefined;
+  if (options.enabledTools) {
+    try {
+      enabledToolsRegex = new RegExp(options.enabledTools, 'i');
+    } catch {
+      // Same as the Graph tools: an invalid pattern is ignored (and logged there).
+    }
+  }
+  // Same gate as the utility tools (#440): --read-only keeps only readOnlyHint: true.
+  const server = {
+    tool: ((name: string, ...args: unknown[]) => {
+      if (options.readOnly && !readOnlyHintOf(args)) return undefined;
+      if (enabledToolsRegex && !enabledToolsRegex.test(name)) return undefined;
+      return (mcpServer.tool as (...a: unknown[]) => unknown).call(mcpServer, name, ...args);
+    }) as McpServer['tool'],
+  };
   server.tool(
     'login',
     'Authenticate with Microsoft account',
     {
       force: z.boolean().default(false).describe('Force a new login even if already logged in'),
     },
+    { title: 'login', readOnlyHint: false, openWorldHint: false },
     async ({ force }) => {
       try {
         if (!force) {
@@ -38,7 +75,6 @@ export function registerAuthTools(server: McpServer, authManager: AuthManager): 
                 type: 'text',
                 text: JSON.stringify({
                   status: 'Login successful',
-                  message: 'Browser authentication completed successfully.',
                   ...loginResult,
                 }),
               },
@@ -46,8 +82,16 @@ export function registerAuthTools(server: McpServer, authManager: AuthManager): 
           };
         }
 
+        // resolve() is the device-code callback: it fires as soon as there is a code to
+        // show, because the user cannot enter a code this tool is still holding. Anything
+        // that fails after that - a rejected account, a cache write that never landed -
+        // arrives with this promise already settled, so reject() is a no-op. The log and
+        // the failure `verify login` reports are what surface it (issue #648).
         const text = await new Promise<string>((resolve, reject) => {
-          authManager.acquireTokenByDeviceCode(resolve).catch(reject);
+          authManager.acquireTokenByDeviceCode(resolve).catch((error: Error) => {
+            logger.error(`Device code login failed after the code was issued: ${error.message}`);
+            reject(error);
+          });
         });
         return {
           content: [
@@ -73,49 +117,61 @@ export function registerAuthTools(server: McpServer, authManager: AuthManager): 
     }
   );
 
-  server.tool('logout', 'Log out from Microsoft account', {}, async () => {
-    try {
-      await authManager.logout();
+  server.tool(
+    'logout',
+    'Log out from Microsoft account',
+    {},
+    { title: 'logout', readOnlyHint: false, openWorldHint: false },
+    async () => {
+      try {
+        await authManager.logout();
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ message: 'Logged out successfully' }),
+            },
+          ],
+        };
+      } catch {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ error: 'Logout failed' }),
+            },
+          ],
+        };
+      }
+    }
+  );
+
+  server.tool(
+    'verify-login',
+    'Check current Microsoft authentication status',
+    {},
+    { title: 'verify-login', readOnlyHint: true, openWorldHint: false },
+    async () => {
+      let testResult: Awaited<ReturnType<AuthManager['testLogin']>>;
+      try {
+        testResult = await authManager.testLogin();
+      } catch (error) {
+        testResult = {
+          success: false,
+          message: `Login failed: ${(error as Error).message}`,
+        };
+      }
+
       return {
         content: [
           {
             type: 'text',
-            text: JSON.stringify({ message: 'Logged out successfully' }),
-          },
-        ],
-      };
-    } catch {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({ error: 'Logout failed' }),
+            text: JSON.stringify(testResult),
           },
         ],
       };
     }
-  });
-
-  server.tool('verify-login', 'Check current Microsoft authentication status', {}, async () => {
-    let testResult: Awaited<ReturnType<AuthManager['testLogin']>>;
-    try {
-      testResult = await authManager.testLogin();
-    } catch (error) {
-      testResult = {
-        success: false,
-        message: `Login failed: ${(error as Error).message}`,
-      };
-    }
-
-    return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify(testResult),
-        },
-      ],
-    };
-  });
+  );
 
   server.tool(
     'list-accounts',
@@ -178,6 +234,7 @@ export function registerAuthTools(server: McpServer, authManager: AuthManager): 
     {
       account: z.string().describe('Email address or account ID of the account to select'),
     },
+    { title: 'select-account', readOnlyHint: false, openWorldHint: false },
     async ({ account }) => {
       try {
         await authManager.selectAccount(account);
@@ -211,6 +268,7 @@ export function registerAuthTools(server: McpServer, authManager: AuthManager): 
     {
       account: z.string().describe('Email address or account ID of the account to remove'),
     },
+    { title: 'remove-account', readOnlyHint: false, openWorldHint: false },
     async ({ account }) => {
       try {
         const success = await authManager.removeAccount(account);

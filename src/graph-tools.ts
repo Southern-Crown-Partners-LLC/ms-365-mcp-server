@@ -1,19 +1,111 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { CallToolRequestSchema, type ServerResult } from '@modelcontextprotocol/sdk/types.js';
 import { randomUUID } from 'crypto';
-import logger from './logger.js';
-import { auditLog, getUserIdentityForAudit } from './audit-log.js';
-import GraphClient from './graph-client.js';
+import { readFileSync } from 'fs';
+import { access } from 'fs/promises';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { z } from 'zod';
+import { auditLog, getUserIdentityForAudit, type AuditEvent } from './audit-log.js';
+import { deriveTargetResource, type AuditTargetResource } from './audit-target-resource.js';
 import AuthManager, {
   getEndpointScopeGroups,
   getMissingAllowedScopesForGroups,
+  isEndpointInScopeMode,
   parseAllowedScopes,
+  scopeModeFor,
+  type ScopeMode,
 } from './auth.js';
-import { api } from './generated/client.js';
 import { api as betaApi } from './generated/client-beta.js';
+import { api } from './generated/client.js';
+import GraphClient, {
+  getBlobMaxBytes,
+  isBlobOutputEnabled,
+  type AcceptFallback,
+} from './graph-client.js';
+import { getAttachmentMinting } from './lib/attachment-minting.js';
+import { MAX_UPLOAD_BYTES, uploadAttachment } from './lib/attachment-upload.js';
+import { getUploadDirs, openUploadFile, type UploadFile } from './lib/upload-dirs.js';
+import {
+  buildAttachmentUrl,
+  type DownloadProbe,
+  isPlainGraphPath,
+  isUnalteredGraphPath,
+  TicketStoreFullError,
+} from './lib/attachment-tickets.js';
+import { buildBM25Index, scoreQuery, tokenize, type BM25Index } from './lib/bm25.js';
+import {
+  CONNECTOR_DEFINITION_BUDGET,
+  DEFAULT_TOOL_DEFINITION_BUDGET,
+  fitToolDefinitionToBudget,
+  getToolDefinitionBudget,
+  measureInputSchemaBytes,
+  type BudgetFitResult,
+} from './lib/body-schema-budget.js';
+import { isDestructiveOperation } from './lib/destructive-ops.js';
+import {
+  CONFIRM_PARAM_DESCRIPTION,
+  DEFAULT_MAX_PAGES,
+  EXPAND_EXTENDED_PROPERTIES_PARAM_DESCRIPTION,
+  getAcceptParamDescription,
+  getAccountParamDescription,
+  getFetchAllPagesParamDescription,
+  getMaxPages,
+  isFetchAllPagesApplicable,
+  isSkiptokenApplicable,
+  DELTA_TOKEN_PARAM_DESCRIPTION,
+  MEMBER_NAME_PARAM_DESCRIPTION,
+  paginationAllowed,
+  positiveIntFromEnv,
+  SKIPTOKEN_PARAM_DESCRIPTION,
+  TIMEZONE_PARAM_DESCRIPTION,
+} from './lib/param-descriptions.js';
+import { describePathParam } from './lib/path-params.js';
+import { queryParameterSchema } from './lib/query-parameter-schema.js';
+import {
+  anyFieldPresent,
+  isTransportEnvelope,
+  parseSelectFields,
+  projectSelectedFields,
+} from './lib/select-projection.js';
+import { parseTeamsUrl } from './lib/teams-url-parser.js';
+import {
+  MAIL_TEXT_DEFAULT_MAX_RESPONSE_CHARS,
+  MAIL_TEXT_DEFAULT_MAX_CHARS,
+  MAIL_TEXT_MAX_INPUT_CHARS,
+  MAIL_TEXT_MAX_IDS,
+  MAIL_TEXT_MAX_TOP,
+  MAIL_TEXT_SELECT,
+  PREFER_TEXT_BODY,
+  oversizeError,
+  toMailTextEntry,
+  validateMailTextArgs,
+  type GraphMessage,
+  type MailTextEntry,
+} from './lib/mail-text.js';
+import { describeToolSchema, describeUtilityToolSchema } from './lib/tool-schema.js';
+import {
+  ACCEPT_VALUE_ERROR,
+  ACCEPT_VALUE_MAX_LENGTH,
+  ACCEPT_VALUE_PATTERN,
+  isAcceptValue,
+} from './lib/media-type.js';
+import {
+  restrictUserFieldQuery,
+  restrictUserFieldUrl,
+  shouldStripUserFieldExpand,
+  stripUserFieldExpandFromUrl,
+  targetsUserProfile,
+  userFieldEnforcement,
+} from './lib/user-field-policy.js';
+import logger from './logger.js';
+import { getRequestTokens } from './request-context.js';
+import { TOOL_CATEGORIES } from './tool-categories.js';
 
 // Tools from every Graph API version share one registry. Each tool's version is carried
 // by its endpoints.json config (apiVersion), so the generated clients stay version-agnostic
 // and the runtime picks the URL prefix per request. v1.0 endpoints are unchanged.
+<<<<<<< HEAD
 const allEndpoints = [...api.endpoints, ...betaApi.endpoints];
 import { z } from 'zod';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
@@ -23,11 +115,12 @@ import { TOOL_CATEGORIES } from './tool-categories.js';
 import { getRequestTokens } from './request-context.js';
 import { parseTeamsUrl } from './lib/teams-url-parser.js';
 import { buildBM25Index, scoreQuery, tokenize, type BM25Index } from './lib/bm25.js';
+=======
+>>>>>>> upstream/main
 export interface DiscoverySearchIndex {
   bm25: BM25Index;
   nameTokens: Map<string, Set<string>>;
 }
-import { describeToolSchema, describeUtilityToolSchema } from './lib/tool-schema.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -38,6 +131,7 @@ interface EndpointConfig {
   toolName: string;
   scopes?: string[] | string[][];
   workScopes?: string[] | string[][];
+  appScopes?: string[] | string[][];
   apiVersion?: string; // Graph API version ('v1.0' default, or 'beta'). Selects spec + URL prefix.
   returnDownloadUrl?: boolean;
   supportsTimezone?: boolean;
@@ -50,6 +144,13 @@ interface EndpointConfig {
   skipEncoding?: string[]; // Parameter names that should NOT be URL-encoded (for function-style API calls)
   contentType?: string;
   acceptType?: string; // Custom Accept header for endpoints returning non-JSON content (e.g., text/vtt)
+  // Retry once with fallback.accept when Graph refuses acceptType with a 403 carrying
+  // fallback.innerErrorCode. Applies whenever acceptType is what goes out (unset, or
+  // echoed by the caller); an explicit, different Accept turns it off.
+  acceptFallback?: AcceptFallback;
+  // A file download. With MS365_MCP_BLOB_OUTPUT on, the tool answers a short JSON text block
+  // plus an MCP blob resource (capped by MS365_MCP_BLOB_MAX_BYTES); it takes an optional fileName.
+  blobOutput?: boolean;
   readOnly?: boolean; // When true, allow this endpoint in read-only mode even if method is not GET
   presets?: string[]; // Presets this endpoint belongs to (mail, outlook, personal, ...)
   // JSON Schema for the request body of an endpoint that Microsoft has NOT published
@@ -57,23 +158,72 @@ interface EndpointConfig {
   // to synthesize a typed requestBody (instead of a generic object), so the generated client
   // exposes a validated `body` param. Ignored for endpoints already present in the spec.
   requestBodySchema?: Record<string, unknown>;
+  // The query parameters Graph really accepts here, when that is fewer than the generic OData
+  // options the spec lists. Unset keeps every generated one. Keep skiptoken where the tool pages.
+  queryParams?: string[];
+  maxTop?: number; // Upper bound for $top, enforced in the schema
+  nameFilter?: boolean; // Adds a `name` param that filters the returned members by displayName/email
+  // Adds a `token` param: Graph pages and resumes this delta query with token=, not $skiptoken
+  deltaToken?: boolean;
+  mentionShorthand?: boolean; // Rewrites <at user-id="..."> in the message body into Graph mentions
+  // A second tool on a Graph operation that already has one, always sending this body.
+  // It is a copy of the generated operation for pathPattern + method without the body
+  // param, so the method, path, confirm gate and read-only handling stay the operation's
+  // own. The generator skips these entries, so the spec keeps one operation per path and
+  // method. delete-mail-message is move-mail-message with { destinationId: 'deleteditems' }.
+  fixedBody?: Record<string, unknown>;
+  disabled?: boolean; // Left out of the generated clients, so never registered
 }
 
 const endpointsData = JSON.parse(
   readFileSync(path.join(__dirname, 'endpoints.json'), 'utf8')
 ) as EndpointConfig[];
 
-/**
- * Delta tools where Graph does NOT support `$top`. The calendarView delta function
- * lists `$top` neither as supported nor among its rejected params; page size is
- * controlled via `Prefer: odata.maxpagesize` instead. By contrast message/driveItem/site
- * delta explicitly document `$top` support, so it must be preserved for those.
- * See https://learn.microsoft.com/en-us/graph/api/event-delta
- */
-const TOP_UNSUPPORTED_DELTA_TOOLS = new Set([
-  'list-calendar-events-delta',
-  'list-calendar-view-delta',
-]);
+// endpoints.json writes path params as {message-id}; the generated client as :messageId.
+export function generatedPathFor(pathPattern: string): string {
+  return pathPattern.replace(
+    /\{([^}]+)\}/g,
+    (_, name: string) => `:${name.replace(/-([a-z])/g, (_m, c: string) => c.toUpperCase())}`
+  );
+}
+
+// A fixedBody entry is not in the generated clients (the generator leaves it out), so it
+// is copied here from the generated operation it shares. An entry whose operation is
+// missing is reported and left out; test/delete-mail-message.test.ts checks that every
+// entry in the shipped endpoints.json resolves.
+export function deriveFixedBodyEndpoints(
+  configs: EndpointConfig[],
+  generated: { v1: typeof api.endpoints; beta: typeof betaApi.endpoints },
+  report: (message: string) => void
+): typeof api.endpoints {
+  const derived: typeof api.endpoints = [];
+  for (const e of configs) {
+    if (!e.fixedBody || e.disabled) continue;
+    const source = e.apiVersion === 'beta' ? generated.beta : generated.v1;
+    const wantedPath = generatedPathFor(e.pathPattern);
+    const base = source.find((t) => t.method === e.method.toLowerCase() && t.path === wantedPath);
+    if (!base) {
+      report(
+        `endpoints.json: ${e.toolName} has fixedBody but no generated operation for ${e.method.toUpperCase()} ${e.pathPattern}; tool not registered`
+      );
+      continue;
+    }
+    derived.push({
+      ...base,
+      alias: e.toolName,
+      parameters: (base.parameters ?? []).filter((p) => p.type !== 'Body'),
+    });
+  }
+  return derived;
+}
+
+const allEndpoints = [
+  ...api.endpoints,
+  ...betaApi.endpoints,
+  ...deriveFixedBodyEndpoints(endpointsData, { v1: api.endpoints, beta: betaApi.endpoints }, (m) =>
+    logger.error(m)
+  ),
+];
 
 /**
  * Prefix beta-version tools with a [beta] marker so the instability is visible in the
@@ -107,29 +257,435 @@ function clampTopQueryParam(queryParams: Record<string, string>): void {
   queryParams['$top'] = String(cap);
 }
 
-const DEFAULT_MAX_PAGES = 100;
-const DEFAULT_MAX_ITEMS = 10_000;
-
-/** Reads a positive-integer env var, falling back to `defaultValue` when unset or invalid. */
-function positiveIntFromEnv(name: string, defaultValue: number): number {
-  const raw = process.env[name];
-  if (raw === undefined || raw === '') return defaultValue;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n < 1) {
-    logger.warn(`Ignoring invalid ${name}=${JSON.stringify(raw)} (use a positive integer)`);
-    return defaultValue;
+/**
+ * The --user-fields allowlist, or undefined when the boundary is off. Throws rather than
+ * returning an empty list: a configured-but-empty allowlist would otherwise send `$select=`
+ * and enforce nothing, which is the opposite of what asking for it means.
+ */
+function parseUserFields(value: string | undefined): string[] | undefined {
+  if (value === undefined) return undefined;
+  const fields = value
+    .split(',')
+    .map((field) => field.trim())
+    .filter(Boolean);
+  if (fields.length === 0) {
+    throw new Error(
+      'User field allowlist was configured but names no fields. Provide one or more comma-separated Graph fields, or omit --user-fields / MS365_MCP_USER_FIELDS.'
+    );
   }
-  return n;
+  return fields;
+}
+
+// Outlook message collections only. The path has to be a mailbox owner, optionally some
+// mailFolders/childFolders nesting, and then end at messages. Matching the owner prefix and
+// the collection name separately would catch /me/chats/{id}/messages, and matching any
+// mailFolders descendant would catch list-mail-folders, list-mail-child-folders,
+// list-mail-rules and list-mail-attachments, none of which take message KQL. /chats, /teams
+// and /planner messages, and directory search, have their own conventions and are untouched.
+const OUTLOOK_MAIL_PATH =
+  /^\/(?:me|users\/[^/]+)(?:\/(?:mailFolders|childFolders)\/[^/]+)*\/messages(?:\/delta\(\))?$/i;
+
+function isOutlookMailPath(path: string): boolean {
+  return OUTLOOK_MAIL_PATH.test(path);
+}
+
+/** A quoted run starting at `start` (an opening quote), with escapes preserved. */
+function readQuotedSegment(
+  expr: string,
+  start: number
+): { segment: string; end: number } | undefined {
+  let j = start + 1;
+  let segment = '';
+  while (j < expr.length) {
+    // Consume an escaped backslash as a unit, otherwise the second slash pairs with a real
+    // delimiter behind it and the scan runs off the end of a well-formed string.
+    if (expr[j] === '\\' && expr[j + 1] === '\\') {
+      segment += '\\\\';
+      j += 2;
+      continue;
+    }
+    if (expr[j] === '\\' && expr[j + 1] === '"') {
+      segment += '\\"';
+      j += 2;
+      continue;
+    }
+    if (expr[j] === '"') return { segment, end: j };
+    segment += expr[j];
+    j += 1;
+  }
+  return undefined;
+}
+
+// The properties KQL recognises on a message, from the searchable-email-property table at
+// learn.microsoft.com/en-us/graph/search-query-parameter. `category` is documented only on
+// the Exchange page that table links to, and both spellings of hasAttachment(s) are here
+// because that table and its own example disagree. Shape alone is not enough to tell a
+// clause from a phrase: "RE: quarterly report" and "Q3: plan.pdf" both look like
+// property:value.
+const MAIL_SEARCH_PROPERTIES = new Set([
+  'attachment',
+  'bcc',
+  'body',
+  'category',
+  'cc',
+  'from',
+  'hasattachment',
+  'hasattachments',
+  'importance',
+  'kind',
+  'participants',
+  'received',
+  'recipients',
+  'sent',
+  'size',
+  'subject',
+  'to',
+]);
+
+/**
+ * `property:` or a comparison — `received>=2024-01-01`, `size>1000`. The value must follow
+ * the operator immediately: KQL demotes a restriction with whitespace around the operator
+ * to free text, so `from: the desk of the CEO` is a phrase that has to keep its quotes,
+ * not a clause to unwrap.
+ */
+const CLAUSE_HEAD = /^([A-Za-z]+)(?::|<=|>=|<>|=|<|>)\S/;
+
+/** KQL's boolean operators: uppercase and free-standing, per the KQL syntax reference. */
+const BOOLEAN_JOIN = /\s(?:AND|OR|NOT)\s/;
+
+/** The recognised `property:`/comparison head of a run, or null if it does not open with one. */
+function clauseHead(segment: string): RegExpExecArray | null {
+  const head = CLAUSE_HEAD.exec(segment);
+  return head && MAIL_SEARCH_PROPERTIES.has(head[1].toLowerCase()) ? head : null;
+}
+
+/** Append a slash when the trailing run is odd, so it cannot escape a quote placed after it. */
+function balanceTrailingSlashes(text: string): string {
+  const slashes = text.length - text.replace(/\\+$/, '').length;
+  return slashes % 2 === 1 ? `${text}\\` : text;
 }
 
 /**
- * Whether `fetchAllPages` is permitted. Defaults to true; set MS365_MCP_ALLOW_PAGINATION
- * to 0/false/no to disable multi-page following entirely (returns the first page only).
+ * How a quoted run should be emitted once the whole expression gains its enclosing pair.
+ *
+ * - `phrase` keeps the quotes where they are, escaped as \". A run holding the value of a
+ *   restriction is always this, even when its text contains a colon
+ *   (subject:"RE: quarterly report"), as is anything that does not open with a recognised
+ *   property at all ("quarterly report", "RE: quarterly report").
+ * - `clause` drops the quotes: either one bare restriction the caller quoted by mistake
+ *   ("from:john" AND subject:meeting), or several joined by boolean operators and quoted as
+ *   a group ("from:john AND subject:meeting" OR from:jane). Both are per-clause quoting,
+ *   which is the directory convention and a 400 here.
+ * - `restriction-value` moves the quotes past the operator: "subject:quarterly report"
+ *   becomes subject:\"quarterly report\". Escaping in place would leave `subject:` inside
+ *   the phrase as literal text and lose the restriction entirely, and dropping the quotes
+ *   would bind only `quarterly` to subject and let `report` float as free text. Only moving
+ *   them keeps both the property and the grouping.
  */
-function paginationAllowed(): boolean {
-  const raw = process.env.MS365_MCP_ALLOW_PAGINATION;
-  if (raw === undefined || raw === '') return true;
-  return !/^(0|false|no)$/i.test(raw.trim());
+type RunKind = 'phrase' | 'clause' | 'restriction-value';
+
+function classifyRun(segment: string, introducedByProperty: boolean): RunKind {
+  if (introducedByProperty) return 'phrase';
+  const head = clauseHead(segment);
+  if (!head) return 'phrase';
+  if (BOOLEAN_JOIN.test(segment) || !/\s/.test(segment)) return 'clause';
+  return 'restriction-value';
+}
+
+/**
+ * Rewrite the interior of a mail KQL expression so it can be wrapped in one pair of
+ * double quotes. Phrase quotes are escaped as \" by analogy with the rule Microsoft
+ * documents for directory search; mail's own docs never show an embedded quote, so that
+ * form is inferred rather than published.
+ */
+function rewriteMailSearchQuotes(expr: string): string {
+  let out = '';
+  let i = 0;
+  while (i < expr.length) {
+    if (expr[i] === '\\' && expr[i + 1] === '\\') {
+      out += '\\\\';
+      i += 2;
+      continue;
+    }
+    if (expr[i] === '\\' && expr[i + 1] === '"') {
+      out += '\\"';
+      i += 2;
+      continue;
+    }
+    if (expr[i] !== '"') {
+      out += expr[i];
+      i += 1;
+      continue;
+    }
+    // An unterminated run is read as a missing closing quote rather than a stray opening
+    // one; dropping the delimiter would shed the grouping and widen the search. Its tail is
+    // balanced first, because the closer synthesized below would otherwise pair with a
+    // trailing backslash and let the next quote end the string early.
+    const run = readQuotedSegment(expr, i);
+    const segment = run ? run.segment : balanceTrailingSlashes(expr.slice(i + 1));
+    const introducedByProperty = i > 0 && expr[i - 1] === ':';
+    switch (classifyRun(segment, introducedByProperty)) {
+      case 'clause':
+        out += segment;
+        break;
+      case 'restriction-value': {
+        const head = clauseHead(segment)!;
+        const valueAt = head[0].length - 1;
+        out += `${segment.slice(0, valueAt)}\\"${segment.slice(valueAt)}\\"`;
+        break;
+      }
+      default:
+        out += `\\"${segment}\\"`;
+    }
+    if (!run) break;
+    i = run.end + 1;
+  }
+  return balanceTrailingSlashes(out.trim());
+}
+
+/**
+ * Keeps only the members whose displayName or email contains `name`. Runs on the final
+ * response body, after $select projection, so a field the caller cannot see is never
+ * matched on. Blank `name` and non-collection bodies pass through unchanged.
+ */
+export function filterMembersByName(parsed: unknown, name: string): unknown {
+  const needle = name.trim().toLowerCase();
+  if (needle === '' || !isPlainObject(parsed) || !Array.isArray(parsed.value)) return parsed;
+  const matches = (member: unknown): boolean =>
+    isPlainObject(member) &&
+    ['displayName', 'email'].some((field) => {
+      const value = member[field];
+      return typeof value === 'string' && value.toLowerCase().includes(needle);
+    });
+  return { ...parsed, value: parsed.value.filter(matches) };
+}
+
+/**
+ * Outlook mail wants the whole KQL expression inside one pair of double quotes
+ * ($search="from:x AND subject:y"). Models quote each clause instead
+ * ($search='"from:x" AND subject:y'), or send a phrase with no enclosing pair
+ * ($search='subject:"quarterly report"'). Both are 400s. Normalize to one enclosing
+ * pair, mirroring the Body auto-wrap already done in executeGraphTool.
+ *
+ * Verified against Graph: a bare single term and a correctly wrapped expression both
+ * succeed; 'subject:"quarterly report"' and '"quarterly report" AND from:x' are both
+ * rejected until the enclosing pair is added.
+ */
+function normalizeSearchQueryParam(
+  queryParams: Record<string, string>,
+  path: string,
+  toolAlias: string
+): CallToolResult | undefined {
+  if (!isOutlookMailPath(path)) return;
+
+  const raw = queryParams['$search'];
+  if (raw === undefined) return;
+  const trimmed = raw.trim();
+
+  // Nothing searchable. Deleting $search would widen the request into an unfiltered listing
+  // of the whole mailbox and hand it back as though it were the search result, which is a
+  // worse answer than the 400 Graph would have returned, so refuse instead.
+  const noSearchableText = (): CallToolResult => {
+    logger.warn(`Refusing ${toolAlias}: '$search' has no searchable text`);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            error: 'invalid_search',
+            tool: toolAlias,
+            message:
+              'The $search parameter has no searchable text. Supply a KQL expression such as "from:john" or "subject:budget", or omit $search to list messages unfiltered.',
+          }),
+        },
+      ],
+      isError: true,
+    };
+  };
+
+  if (trimmed === '' || /^["'\s]+$/.test(trimmed)) return noSearchableText();
+
+  // An expression already inside one enclosing pair is unwrapped first, so its interior
+  // is judged on its own terms and re-wrapped unchanged. Without this, a correctly
+  // wrapped free-text search ("quarterly report") would be read as a phrase and become
+  // a phrase search ("\"quarterly report\"").
+  let expr = trimmed;
+  if (expr.startsWith('"')) {
+    const whole = readQuotedSegment(expr, 0);
+    // No closing quote at all means the caller dropped it off the enclosing pair, not that
+    // they opened a phrase. Reading it as a phrase would send a literal search for the whole
+    // expression, which matches nothing and gives the model no error to correct against.
+    if (!whole) expr = expr.slice(1);
+    else if (whole.end === expr.length - 1) expr = whole.segment;
+  }
+
+  const inner = rewriteMailSearchQuotes(expr);
+  // Unreachable while the guard above catches every all-quote/whitespace value; kept so a
+  // later change to the rewriter cannot quietly send Graph $search="".
+  if (inner === '') return noSearchableText();
+  const normalized = `"${inner}"`;
+  if (normalized !== raw) {
+    logger.info(`Auto-corrected parameter '$search': normalized KQL quoting to ${normalized}`);
+    queryParams['$search'] = normalized;
+  }
+}
+
+/**
+ * `skiptoken` takes what a model copies out of a response: the whole @odata.nextLink, a
+ * `$skiptoken=...` fragment, or the bare token, percent-encoded or not. Outlook mail and
+ * calendar links page with $skip instead, so that value goes out as $skip
+ * (https://learn.microsoft.com/en-us/graph/query-parameters). A link carrying neither is
+ * refused: forwarding it hands Graph a garbage cursor, and dropping it would return the
+ * first page as though it were the next one. Delta tools whose links page with a token=
+ * value land there too; they take that link in their own `token` param (deltaToken).
+ */
+function normalizeSkiptokenQueryParam(
+  queryParams: Record<string, string>,
+  toolAlias: string,
+  deltaToken = false
+): CallToolResult | undefined {
+  const raw = queryParams['$skiptoken'];
+  if (raw === undefined) return;
+  delete queryParams['$skiptoken'];
+
+  let token = raw.trim();
+  if (token === '') return;
+
+  const cursorlessLink = (): CallToolResult => {
+    logger.warn(`Refusing ${toolAlias}: 'skiptoken' has no $skiptoken or $skip to page with`);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            error: 'invalid_skiptoken',
+            tool: toolAlias,
+            message:
+              'The value passed as skiptoken has no $skiptoken or $skip to page with.' +
+              (deltaToken
+                ? ' This tool pages and resumes with a token= link: pass that link as token instead of skiptoken.'
+                : ' Delta tools that page with a token= link take it in their token parameter, where they have one.') +
+              (paginationAllowed()
+                ? ' Remove skiptoken and retry with fetchAllPages set to true to follow the link, or remove it for the first page.'
+                : ' Remove skiptoken and retry for the first page.'),
+          }),
+        },
+      ],
+      isError: true,
+    };
+  };
+
+  // Anchored on the start or a query separator, so a cursor-looking value inside another
+  // param (a $filter compared against the text "$skip=100", say) cannot be read as the cursor
+  const marker = token.match(/(?:^|[?&])(?:\$|%24)skiptoken=/i);
+  if (marker?.index !== undefined) {
+    // A nextLink can carry params after the cursor; keep only this one's value
+    token = token.slice(marker.index + marker[0].length).split('&')[0];
+    // A link that names the cursor but carries no value is not a first-page call
+    if (token === '') return cursorlessLink();
+  } else if (/:\/\/|\?|^(?:\$|%24)\w+=/.test(token)) {
+    const skip = token.match(/(?:^|[?&])(?:\$|%24)skip=(\d+)(?=&|$)/i)?.[1];
+    if (skip === undefined) return cursorlessLink();
+    logger.info(
+      `Auto-corrected parameter 'skiptoken': link pages with $skip, sending $skip=${skip}`
+    );
+    queryParams['$skip'] = skip;
+    return;
+  }
+
+  if (token.includes('%')) {
+    try {
+      token = decodeURIComponent(token);
+    } catch {
+      logger.warn('skiptoken looks percent-encoded but could not be decoded; sending as-is');
+    }
+  }
+  queryParams['$skiptoken'] = token;
+}
+
+/**
+ * `token` (endpoints with deltaToken) takes the delta state Graph hands back: the bare token,
+ * `latest`, or the whole @odata.nextLink / @odata.deltaLink, whose token sits in a query
+ * string (`?token=...`) or in function form (`delta(token='...')`). The token is sent as
+ * Graph's `token` query parameter, percent-decoded once so it is not encoded twice
+ * (https://learn.microsoft.com/en-us/graph/api/driveitem-delta). A link with a $deltatoken
+ * instead resends that. A link carrying neither is refused rather than starting a full
+ * enumeration the caller did not ask for.
+ */
+function normalizeDeltaTokenParam(
+  raw: unknown,
+  queryParams: Record<string, string>,
+  toolAlias: string
+): CallToolResult | undefined {
+  if (raw === undefined || raw === null) return;
+  let token = `${raw}`.trim();
+  if (token === '') return;
+
+  const invalidToken = (): CallToolResult => {
+    logger.warn(`Refusing ${toolAlias}: 'token' has no token value to resume from`);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            error: 'invalid_delta_token',
+            tool: toolAlias,
+            message:
+              'The value passed as token has no token= value. Pass the @odata.nextLink or @odata.deltaLink this tool returned, the bare token from it, or latest. Remove token to enumerate from the start.',
+          }),
+        },
+      ],
+      isError: true,
+    };
+  };
+
+  // Anchored on the start or a separator, so $deltatoken= and $skiptoken= are not read as token=
+  const marker = token.match(/(?:^|[?&(,])token=(?:'([^']*)'|([^&)#']*))/i);
+  if (marker) {
+    token = marker[1] ?? marker[2];
+  } else if (/:\/\/|[?(]/.test(token)) {
+    const deltatoken = token.match(/(?:^|[?&])(?:\$|%24)deltatoken=([^&#]*)/i)?.[1];
+    if (!deltatoken) return invalidToken();
+    queryParams['$deltatoken'] = decodeOnce(deltatoken);
+    return;
+  }
+  if (token === '') return invalidToken();
+  queryParams['token'] = decodeOnce(token);
+}
+
+function decodeOnce(value: string): string {
+  if (!value.includes('%')) return value;
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    logger.warn('Delta token looks percent-encoded but could not be decoded; sending as-is');
+    return value;
+  }
+}
+
+const DEFAULT_MAX_ITEMS = 10_000;
+
+// Canonical definitions of paginationAllowed and
+// positiveIntFromEnv live in lib/param-descriptions.ts so tool-schema.ts can use
+// them without circling back through graph-tools.ts, and so the description text
+// they parameterize can't drift between the two registration paths (see that
+// file's header comment).
+
+// Canonical definition lives in lib/destructive-ops.ts so tool-schema.ts can
+// use it without circling back through graph-tools.ts; re-exported here for
+// external callers (tests, etc.) that imported it from this module.
+export { isDestructiveOperation };
+
+/**
+ * Defense-in-depth: destructive tools require an explicit `confirm: true` from
+ * the caller before they reach Microsoft Graph. Mitigates accidental
+ * sendMail / deleteEvent / etc. when an LLM misroutes a request or follows an
+ * injected instruction. Opt in per-deployment via MS365_MCP_REQUIRE_CONFIRM=true
+ * (default off, so the gate is a non-breaking, additive opt-in that can coexist
+ * with client-side elicitation prompts).
+ */
+function isConfirmGateEnabled(): boolean {
+  return process.env.MS365_MCP_REQUIRE_CONFIRM === 'true';
 }
 
 type TextContent = {
@@ -186,11 +742,382 @@ interface CallToolResult {
   [key: string]: unknown;
 }
 
+function auditHttpStatus(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isInteger(value)) return value;
+  if (typeof value === 'string' && /^\d+$/.test(value)) return Number(value);
+  return undefined;
+}
+
+function auditErrorCode(value: unknown): string | number | undefined {
+  return typeof value === 'string' || typeof value === 'number' ? value : undefined;
+}
+
+function auditNonNegativeInteger(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : undefined;
+}
+
+function auditStringNumberMap(value: unknown): Record<string, number> | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
+
+  const entries = Object.entries(value).filter(
+    (entry): entry is [string, number] =>
+      typeof entry[1] === 'number' && Number.isInteger(entry[1]) && entry[1] >= 0
+  );
+
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+}
+
+function graphResponseAuditFields(
+  response: Pick<CallToolResult, '_meta' | 'isError'>
+): Pick<
+  AuditEvent,
+  | 'http_status'
+  | 'error_code'
+  | 'graph_batch_subrequest_count'
+  | 'graph_batch_http_status_counts'
+  | 'graph_batch_error_code_counts'
+  | 'result_count'
+  | 'result_has_more'
+  | 'response_bytes'
+> {
+  const httpStatus = auditHttpStatus(response._meta?.http_status);
+  const errorCode = response.isError ? auditErrorCode(response._meta?.error_code) : undefined;
+  const graphBatchSubrequestCount = auditNonNegativeInteger(
+    response._meta?.graph_batch_subrequest_count
+  );
+  const graphBatchHttpStatusCounts = auditStringNumberMap(
+    response._meta?.graph_batch_http_status_counts
+  );
+  const graphBatchErrorCodeCounts = auditStringNumberMap(
+    response._meta?.graph_batch_error_code_counts
+  );
+  const resultCount = auditNonNegativeInteger(response._meta?.result_count);
+  const responseBytes = auditNonNegativeInteger(response._meta?.response_bytes);
+  const resultHasMore =
+    typeof response._meta?.result_has_more === 'boolean'
+      ? response._meta.result_has_more
+      : undefined;
+
+  return {
+    ...(resultCount !== undefined ? { result_count: resultCount } : {}),
+    ...(resultHasMore !== undefined ? { result_has_more: resultHasMore } : {}),
+    ...(responseBytes !== undefined ? { response_bytes: responseBytes } : {}),
+    ...(httpStatus !== undefined ? { http_status: httpStatus } : {}),
+    ...(errorCode !== undefined ? { error_code: errorCode } : {}),
+    ...(graphBatchSubrequestCount !== undefined
+      ? { graph_batch_subrequest_count: graphBatchSubrequestCount }
+      : {}),
+    ...(graphBatchHttpStatusCounts !== undefined
+      ? { graph_batch_http_status_counts: graphBatchHttpStatusCounts }
+      : {}),
+    ...(graphBatchErrorCodeCounts !== undefined
+      ? { graph_batch_error_code_counts: graphBatchErrorCodeCounts }
+      : {}),
+  };
+}
+
+// Graph is inconsistent about casing: entity creation (POST /me/messages) uses
+// camelCase body fields, while action endpoints (POST .../forward, /me/sendMail)
+// use PascalCase. Matched case-insensitively so both are covered.
+const RECIPIENT_FIELDS = new Set([
+  'torecipients',
+  'ccrecipients',
+  'bccrecipients',
+  'attendees',
+  // driveItem /invite mails an outsider a link to the file
+  'recipients',
+]);
+// Worst shape the docstring below promises to cover is 7, not 4: a graph-batch
+// sub-request carrying an itemAttachment lands at requests -> request -> body -> message
+// -> attachments -> attachment -> item, and the attached message's own toRecipients match
+// there. That leaves one level spare, so this can't be trimmed without giving that case
+// up - there's a test pinning it. Arrays charge depth too - traversing them for free
+// leaves an array-only path unbounded, and this runs inside the catch handler where a
+// stack overflow would take the audit record with it.
+const MAX_BODY_DEPTH = 8;
+// A big distribution list would otherwise dump every domain into one audit line, at
+// a length the caller picks. recipient_count is untouched, so we never lose how many.
+const MAX_RECIPIENT_DOMAINS = 50;
+
+// Graph matches property names case-insensitively, so we have to as well - or a
+// PascalCase payload sends mail the log never sees
+function lookupCaseInsensitive(node: unknown, lowerName: string): unknown {
+  if (!node || typeof node !== 'object') return undefined;
+  for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+    if (key.toLowerCase() === lowerName) return value;
+  }
+  return undefined;
+}
+
+// Recipients are not one shape: mail and events use emailAddress.address, driveItem
+// /invite uses email, meeting participants use upn. alias/objectId name someone with
+// no domain at all - those still count, they just don't add one.
+function readAddress(entry: unknown): string | undefined {
+  // Graph 400s a bare string in a recipient array, but the attempt is the signal and
+  // everything else here reads high - this shouldn't be the one place that reads low
+  if (typeof entry === 'string') return entry;
+
+  const emailAddress = lookupCaseInsensitive(entry, 'emailaddress');
+  const candidates = [
+    typeof emailAddress === 'string'
+      ? emailAddress
+      : lookupCaseInsensitive(emailAddress, 'address'),
+    lookupCaseInsensitive(entry, 'email'),
+    lookupCaseInsensitive(entry, 'upn'),
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate) return candidate;
+  }
+  return undefined;
+}
+
+// Positive check, not suffix-stripping. Everything after the last @ is caller-controlled
+// and Graph tolerates enough junk that subtracting kept losing - "example.com/path" and
+// "evil<script" both got through. Anything that isn't a plain dotted hostname gets dropped.
+const DOMAIN_PATTERN = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
+// Longest a domain can legally be (RFC 1035). The pattern accepts any length, and the
+// 50-entry cap only bounds how many domains land in a record, not how long each one is -
+// without this one address picks the size of the audit line. Tested before the pattern so
+// a caller can't make us scan a huge string either.
+const MAX_DOMAIN_LENGTH = 253;
+
+function addRecipient(entry: unknown, domains: Set<string>, counter: { count: number }): void {
+  // Count the entry, not our ability to parse it
+  counter.count += 1;
+
+  const address = readAddress(entry);
+  if (address === undefined) return;
+  const at = address.lastIndexOf('@');
+  if (at <= 0 || at >= address.length - 1) return;
+  // Peel the wrappers Graph tolerates, then let the pattern decide
+  const domain = address
+    .slice(at + 1)
+    .trim()
+    .split(/\s/)[0]
+    .replace(/[>.]+$/, '')
+    .toLowerCase();
+  if (domain.length <= MAX_DOMAIN_LENGTH && DOMAIN_PATTERN.test(domain)) domains.add(domain);
+}
+
+function collectRecipients(
+  node: unknown,
+  domains: Set<string>,
+  counter: { count: number },
+  depth = 0
+): void {
+  if (!node || typeof node !== 'object' || depth > MAX_BODY_DEPTH) return;
+
+  if (Array.isArray(node)) {
+    for (const item of node) collectRecipients(item, domains, counter, depth + 1);
+    return;
+  }
+
+  for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+    if (RECIPIENT_FIELDS.has(key.toLowerCase()) && Array.isArray(value)) {
+      for (const entry of value) addRecipient(entry, domains, counter);
+      continue;
+    }
+    // Walk everything, not an allowlist of container names - a recipient list
+    // nested somewhere we didn't think of still sends real mail
+    collectRecipients(value, domains, counter, depth + 1);
+  }
+}
+
+const AAD_GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SHORTHAND_AT = /<at\s+user-id="([^"]*)">([^<]*)<\/at>/gi;
+// Any tag that tries the shorthand, well-formed or not. A malformed one must be refused:
+// left alone it is posted to colleagues as literal text and nobody is notified.
+const HAS_SHORTHAND = /<at\b[^>]*\buser-id\b/i;
+
+/**
+ * Teams mentions need numbered <at id="N"> tags plus a matching `mentions` array, and a
+ * mismatch is a 400. Models write <at user-id="<aad-guid>">Name</at> instead; this
+ * numbers each tag above any id already present and builds the mentions entries.
+ * Bodies without the shorthand and non-object bodies pass through. The shorthand with
+ * non-html content, or in a form it cannot rewrite, is an error rather than a literal tag.
+ */
+export function rewriteMentionShorthand(body: unknown): { body: unknown; error?: string } {
+  if (!isPlainObject(body) || !isPlainObject(body.body)) return { body };
+  const itemBody = body.body;
+  const content = itemBody.content;
+  if (typeof content !== 'string' || !HAS_SHORTHAND.test(content)) return { body };
+  if (String(itemBody.contentType).toLowerCase() !== 'html') {
+    return {
+      body,
+      error:
+        'The <at user-id> mention shorthand needs contentType "html" on the message body. Set body.contentType to "html".',
+    };
+  }
+
+  const existing = Array.isArray(body.mentions) ? body.mentions : [];
+  let nextId = 0;
+  for (const m of existing) {
+    if (isPlainObject(m) && typeof m.id === 'number') nextId = Math.max(nextId, m.id + 1);
+  }
+  for (const m of content.matchAll(/<at\s+id="(\d+)"/gi)) {
+    nextId = Math.max(nextId, Number(m[1]) + 1);
+  }
+
+  const added: unknown[] = [];
+  let error: string | undefined;
+  const rewritten = content.replace(SHORTHAND_AT, (tag, userId: string, name: string) => {
+    if (!AAD_GUID.test(userId)) {
+      error ??= `Mention user-id "${userId}" is not an Entra object id (GUID). Use the userId from list-team-members or list-chat-members.`;
+      return tag;
+    }
+    const id = nextId++;
+    added.push({
+      id,
+      mentionText: name,
+      mentioned: { user: { id: userId, displayName: name, userIdentityType: 'aadUser' } },
+    });
+    return `<at id="${id}">${name}</at>`;
+  });
+
+  if (error) return { body, error };
+  if (HAS_SHORTHAND.test(rewritten)) {
+    return {
+      body,
+      error:
+        'Unsupported mention tag form. Write <at user-id="<guid>">Name</at> with double quotes, no other attributes and plain text inside.',
+    };
+  }
+  return {
+    body: { ...body, body: { ...itemBody, content: rewritten }, mentions: [...existing, ...added] },
+  };
+}
+
+// A body that failed schema parsing goes to Graph as a raw string, and mail sent that way
+// would record nothing. Only a JSON-shaped string can carry recipients though: the binary
+// upload tools send base64, and parsing that threw on every single upload.
+function bodyForRecipientWalk(body: unknown): unknown {
+  if (typeof body !== 'string') return body;
+  if (!/^\s*[{[]/.test(body)) return undefined;
+  return JSON.parse(body);
+}
+
+/**
+ * Derives recipient metadata from an outgoing request body for the audit trail.
+ *
+ * A send, forward or meeting invite records that the tool ran but not who it
+ * reached, so an instruction injected via message content that quietly addresses
+ * something outside the organisation looks identical in the log to a legitimate
+ * reply.
+ *
+ * Domains, not addresses. The detection question is "did this leave the
+ * organisation", which a domain answers; the full address is message content and
+ * logging it by default would be a heavier privacy cost than the signal
+ * justifies. Counts alone cannot distinguish internal from external.
+ *
+ * Covers mail recipients, event attendees and driveItem /invite recipients, at
+ * any casing and up to MAX_BODY_DEPTH levels down, including inside a
+ * graph-batch sub-request and inside a body forwarded as a raw JSON string.
+ *
+ * recipient_count is entries in a recipient-shaped array; a driveRecipient given
+ * only as alias or objectId counts but yields no domain. Keyed on body shape,
+ * not on the endpoint, so drafts and event edits count like real sends, and so
+ * does an attached message's own toRecipients inside an itemAttachment. Reads
+ * high rather than low, which is the safe direction for a detection signal.
+ *
+ * Gaps remain, so absence of these fields is NOT evidence that nothing left
+ * the organisation:
+ *  - On `reply` / `replyAll`, recipients added via the optional `Message` are
+ *    recorded, but the original thread's are resolved server-side by Graph and
+ *    never appear. A plain reply-all to a wide external thread records nothing.
+ *  - `POST /me/messages/{id}/send` carries no body. Its recipients were logged
+ *    when the draft was created, but only if the draft was created through this
+ *    server; one composed in Outlook and sent here records nothing.
+ *
+ * Policy-denied attempts (`tool.denied`) also record none, but nothing was sent.
+ */
+function recipientAuditFields(
+  body: unknown
+): Pick<AuditEvent, 'recipient_count' | 'recipient_domains' | 'recipient_domains_truncated'> {
+  const domains = new Set<string>();
+  const counter = { count: 0 };
+  // Broader than a recursion guard on purpose: this also runs on the catch path, where
+  // throwing would cost the audit record AND the caller's error response. Losing the
+  // fields beats losing both.
+  try {
+    collectRecipients(bodyForRecipientWalk(body), domains, counter);
+  } catch (error) {
+    logger.warn(
+      `Skipped recipient audit metadata: ${error instanceof Error ? error.message : 'unknown error'}`
+    );
+    return {};
+  }
+
+  if (counter.count === 0) return {};
+  const sorted = [...domains].sort();
+  const capped = sorted.slice(0, MAX_RECIPIENT_DOMAINS);
+  return {
+    recipient_count: counter.count,
+    ...(capped.length > 0 ? { recipient_domains: capped } : {}),
+    ...(sorted.length > capped.length ? { recipient_domains_truncated: true } : {}),
+  };
+}
+
+function thrownErrorAuditFields(error: unknown): Pick<AuditEvent, 'http_status' | 'error_code'> {
+  const err = error as {
+    code?: string | number;
+    status?: string | number;
+    httpStatus?: string | number;
+    graphErrorCode?: string | number;
+  };
+  const httpStatus = auditHttpStatus(err?.httpStatus ?? err?.status);
+  const errorCode = auditErrorCode(err?.graphErrorCode ?? err?.code ?? err?.status);
+
+  return {
+    ...(httpStatus !== undefined ? { http_status: httpStatus } : {}),
+    ...(errorCode !== undefined ? { error_code: errorCode } : {}),
+  };
+}
+
+async function executeUtilityTool(
+  utility: UtilityTool,
+  ctx: UtilityToolContext,
+  params: Record<string, unknown>
+): Promise<CallToolResult> {
+  const requestId = randomUUID();
+  const startTime = Date.now();
+  const upn = getUserIdentityForAudit(getRequestTokens()?.accessToken);
+
+  try {
+    const response = await utility.execute(params, ctx);
+    auditLog({
+      event: 'tool.call',
+      request_id: requestId,
+      user_principal_name: upn,
+      tool: utility.name,
+      http_method: utility.method.toUpperCase(),
+      status: response.isError ? 'error' : 'success',
+      duration_ms: Date.now() - startTime,
+      ...graphResponseAuditFields(response),
+    });
+    return response;
+  } catch (error) {
+    const err = error as { name?: string };
+    auditLog({
+      event: 'tool.call',
+      request_id: requestId,
+      user_principal_name: upn,
+      tool: utility.name,
+      http_method: utility.method.toUpperCase(),
+      status: 'error',
+      duration_ms: Date.now() - startTime,
+      error_type: err?.name || 'Error',
+      ...thrownErrorAuditFields(error),
+    });
+    throw error;
+  }
+}
+
 interface UtilityToolContext {
   graphClient: GraphClient;
   authManager?: AuthManager;
   multiAccount: boolean;
   accountNames: string[];
+  userFields?: string[];
 }
 
 interface UtilityTool {
@@ -205,11 +1132,38 @@ interface UtilityTool {
   execute: (params: Record<string, unknown>, ctx: UtilityToolContext) => Promise<CallToolResult>;
   readOnlyHint?: boolean;
   openWorldHint?: boolean;
+  // When true, this tool reads or writes the server's local filesystem and is only
+  // registered in stdio mode, or over HTTP with --http-local-file-tools.
+  stdioOnly?: boolean;
+  // Registered only while this returns true, for a tool that needs operator opt-in.
+  enabled?: () => boolean;
+  // Works only on the signed-in user's own /me paths, so it is hidden in --app-mode.
+  meOnly?: boolean;
+}
+
+export function isUtilityToolAvailable(
+  utility: UtilityTool,
+  options: { readOnly: boolean; httpMode: boolean; scopeMode: ScopeMode }
+): boolean {
+  if (options.readOnly && !utility.readOnlyHint) return false;
+  if (options.httpMode && utility.stdioOnly) return false;
+  if (options.scopeMode === 'app' && utility.meOnly) return false;
+  if (utility.enabled && !utility.enabled()) return false;
+  return true;
 }
 
 interface DisabledToolScope {
   toolName: string;
   missingScopes: string[];
+}
+
+type ToolDeniedReason = 'allowed_scopes' | 'tool_allowlist';
+
+interface DeniedToolPolicy {
+  toolName: string;
+  reason: ToolDeniedReason;
+  missingScopes?: string[];
+  pathPattern?: string;
 }
 
 function formatDisabledToolsForLog(disabledTools: DisabledToolScope[]): string {
@@ -219,6 +1173,129 @@ function formatDisabledToolsForLog(disabledTools: DisabledToolScope[]): string {
   const suffix =
     disabledTools.length > shown.length ? `, ... +${disabledTools.length - shown.length} more` : '';
   return `${shown.join('; ')}${suffix}`;
+}
+
+function deniedToolPolicyForGraphTool(
+  tool: (typeof allEndpoints)[number],
+  config: EndpointConfig | undefined,
+  reason: ToolDeniedReason,
+  missingScopes?: string[]
+): DeniedToolPolicy {
+  return {
+    toolName: tool.alias,
+    reason,
+    ...(missingScopes && missingScopes.length > 0 ? { missingScopes } : {}),
+    pathPattern: config?.pathPattern ?? tool.path,
+  };
+}
+
+function collectDeniedToolPolicies(options: {
+  readOnly: boolean;
+  scopeMode: ScopeMode;
+  enabledToolsRegex?: RegExp;
+  allowedScopesValue?: string;
+  httpMode: boolean;
+}): Map<string, DeniedToolPolicy> {
+  const deniedTools = new Map<string, DeniedToolPolicy>();
+  const allowedScopes = parseAllowedScopes(options.allowedScopesValue);
+
+  for (const tool of allEndpoints) {
+    const endpointConfig = endpointsData.find((e) => e.toolName === tool.alias);
+    if (!isEndpointInScopeMode(endpointConfig, options.scopeMode)) {
+      continue;
+    }
+
+    const method = tool.method.toUpperCase();
+    if (options.readOnly && method !== 'GET' && !(method === 'POST' && endpointConfig?.readOnly)) {
+      continue;
+    }
+
+    if (options.enabledToolsRegex && !options.enabledToolsRegex.test(tool.alias)) {
+      deniedTools.set(
+        tool.alias,
+        deniedToolPolicyForGraphTool(tool, endpointConfig, 'tool_allowlist')
+      );
+      continue;
+    }
+
+    const missingScopes =
+      allowedScopes !== undefined && !endpointConfig
+        ? ['endpoint scope metadata']
+        : getMissingAllowedScopesForGroups(
+            getEndpointScopeGroups(endpointConfig, options.scopeMode),
+            allowedScopes
+          );
+    if (missingScopes.length > 0) {
+      deniedTools.set(
+        tool.alias,
+        deniedToolPolicyForGraphTool(tool, endpointConfig, 'allowed_scopes', missingScopes)
+      );
+    }
+  }
+
+  for (const utility of UTILITY_TOOLS) {
+    if (!isUtilityToolAvailable(utility, options)) continue;
+    if (options.enabledToolsRegex && !options.enabledToolsRegex.test(utility.name)) {
+      deniedTools.set(utility.name, {
+        toolName: utility.name,
+        reason: 'tool_allowlist',
+      });
+    }
+  }
+
+  return deniedTools;
+}
+
+function auditToolDenied(policy: DeniedToolPolicy, params: Record<string, unknown> = {}): void {
+  const targetResource = policy.pathPattern
+    ? deriveTargetResource({ pathPattern: policy.pathPattern, params })
+    : undefined;
+
+  auditLog({
+    event: 'tool.denied',
+    request_id: randomUUID(),
+    user_principal_name: getUserIdentityForAudit(getRequestTokens()?.accessToken),
+    tool: policy.toolName,
+    status: 'denied',
+    reason: policy.reason,
+    ...(policy.missingScopes ? { missing_scopes: policy.missingScopes } : {}),
+    ...(targetResource ? { target_resource: targetResource } : {}),
+  });
+}
+
+function installDeniedToolAuditHandler(
+  server: McpServer,
+  deniedTools: ReadonlyMap<string, DeniedToolPolicy>
+): void {
+  if (deniedTools.size === 0) return;
+
+  const lowLevel = server.server;
+  const handlers = (
+    lowLevel as unknown as {
+      _requestHandlers?: Map<
+        string,
+        (request: unknown, extra: unknown) => Promise<ServerResult> | ServerResult
+      >;
+    }
+  )._requestHandlers;
+  const original = handlers?.get('tools/call');
+  if (!original) {
+    logger.warn('Skipping denied-tool audit hook: tools/call handler not found');
+    return;
+  }
+
+  lowLevel.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+    const policy = deniedTools.get(request.params.name);
+    if (policy) {
+      const params =
+        request.params.arguments && typeof request.params.arguments === 'object'
+          ? (request.params.arguments as Record<string, unknown>)
+          : {};
+      auditToolDenied(policy, params);
+    }
+
+    return original(request, extra);
+  });
 }
 
 /**
@@ -250,7 +1327,582 @@ async function checkAccountParamInBearerMode(
   );
 }
 
+/**
+ * Mint a server-served download URL for a Graph byte resource Graph itself
+ * exposes no pre-authenticated URL for, or return null if minting is off.
+ *
+ * **This grants no authority the calling agent did not already hold.** Every
+ * target that reaches here is one `download-bytes` would fetch for the same
+ * caller on the same account; the ticket only moves those bytes out of the
+ * agent's context window and into a direct transfer. That is the whole
+ * security argument for the feature, and it is why minting is scoped to the
+ * byte endpoints below rather than to any Graph path.
+ *
+ * Returns null when the feature is disabled, so the caller falls through to
+ * the refusal it would have given before -- the tool's behaviour is unchanged
+ * for anyone not running with `--enable-attachment-urls`.
+ */
+const UPLOAD_TARGET = /^(\/me|\/users\/[^/]+)\/(messages|events)\/[^/]+\/attachments$/;
+const UPLOAD_CONTENT_TYPE = /^[\w.+-]+\/[\w.+-]+$/;
+/** Content-ID of an inline attachment: what the body references as cid:<contentId>. */
+const UPLOAD_CONTENT_ID = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,99}$/;
+const UPLOAD_CONTENT_ID_ERROR =
+  'contentId may hold letters, digits, ".", "_", "@" and "-" (at most 100), e.g. signature-photo.';
+const contentIdSchema = z
+  .string()
+  .optional()
+  .describe(
+    'Attach inline under this Content-ID instead of as a regular attachment, so the HTML body can show the file with <img src="cid:<contentId>">, e.g. a picture in an email signature. Letters, digits, ".", "_", "@", "-".'
+  );
+
+const UPLOAD_TARGET_ERROR =
+  'target must be the attachments collection of a draft message or an event: /me/messages/{message-id}/attachments or /me/events/{event-id}/attachments (or /users/{user-id}/... for another mailbox).';
+
+// A OneDrive or SharePoint folder the uploaded file lands in: a drive's root or a folder
+// item, addressed by id. The server appends :/{name}:/createUploadSession itself.
+const DRIVE_UPLOAD_TARGET =
+  /^(?:\/drives\/[^/]+|\/(?:me|users\/[^/]+|groups\/[^/]+|sites\/[^/]+)\/drive|\/(?:groups|sites)\/[^/]+\/drives\/[^/]+)\/(?:root|items\/[^/]+)$/;
+const UPLOAD_ANY_TARGET_ERROR = `${UPLOAD_TARGET_ERROR} Or a OneDrive/SharePoint folder: /me/drive/root, /me/drive/items/{folder-id}, /drives/{drive-id}/items/{folder-id} or /sites/{site-id}/drive/items/{folder-id}.`;
+// Characters OneDrive and SharePoint refuse in a file name; "/" and "\" would also turn
+// the name into a path.
+const DRIVE_NAME_FORBIDDEN = /["*:<>?/\\|]/;
+const DRIVE_CONFLICT_BEHAVIORS = ['fail', 'replace', 'rename'] as const;
+
+function uploadError(message: string): CallToolResult {
+  return { content: [{ type: 'text', text: JSON.stringify({ error: message }) }], isError: true };
+}
+
+function cleanAttachmentName(name: string): string {
+  return Array.from(name.trim())
+    .filter((char) => {
+      const code = char.charCodeAt(0);
+      return code > 0x1f && code !== 0x7f;
+    })
+    .join('')
+    .slice(0, 255);
+}
+
+/** False for a string with a lone surrogate, which encodeURIComponent cannot encode. */
+function isEncodable(value: string): boolean {
+  try {
+    encodeURIComponent(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** An empty or non-string contentId means a regular attachment. */
+function optionalContentId(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+/**
+ * Mint an upload ticket for `target`, the `/attachments` collection of a draft
+ * message or an event, redeemed by one PUT of the file bytes. Same identity
+ * rules as mintDownloadUrl: when Graph identity came from the request, the
+ * ticket keeps that token and the upload is attached as that caller.
+ */
+async function mintUploadUrl(
+  target: string,
+  name: string,
+  contentType: string,
+  accountParam: string | undefined,
+  authManager: AuthManager | undefined,
+  contentId?: string,
+  conflictBehavior?: unknown
+): Promise<CallToolResult> {
+  const minting = getAttachmentMinting();
+  const isDrive = DRIVE_UPLOAD_TARGET.test(target);
+  if (!minting) {
+    if (isDrive) {
+      return uploadError(
+        'This server is not running with --enable-attachment-urls, so no upload URL can be minted. Upload small files with upload-file-content, or get a Graph upload URL with create-upload-session.'
+      );
+    }
+    const smallFileTool = target.includes('/events/')
+      ? 'add-calendar-event-attachment'
+      : target.startsWith('/users/')
+        ? 'add-shared-mailbox-attachment'
+        : 'add-mail-attachment';
+    return uploadError(
+      `This server is not running with --enable-attachment-urls, so no upload URL can be minted. Attach small files with ${smallFileTool} (base64 contentBytes).`
+    );
+  }
+  if ((!UPLOAD_TARGET.test(target) && !isDrive) || !isPlainGraphPath(target)) {
+    return uploadError(UPLOAD_ANY_TARGET_ERROR);
+  }
+  const cleanName = cleanAttachmentName(name);
+  if (!cleanName) return uploadError('name is required.');
+  if (!UPLOAD_CONTENT_TYPE.test(contentType)) {
+    return uploadError('contentType must be a MIME type such as application/pdf.');
+  }
+  if (contentId !== undefined && !UPLOAD_CONTENT_ID.test(contentId)) {
+    return uploadError(UPLOAD_CONTENT_ID_ERROR);
+  }
+  let drive: { conflictBehavior: (typeof DRIVE_CONFLICT_BEHAVIORS)[number] } | undefined;
+  if (isDrive) {
+    if (contentId !== undefined) {
+      return uploadError('contentId applies only to mail and event attachments, not drive files.');
+    }
+    // Refuse rather than clean: a trimmed or shortened name would land on, and with
+    // replace overwrite, a file the caller did not name.
+    if (
+      cleanName !== name ||
+      DRIVE_NAME_FORBIDDEN.test(name) ||
+      name.endsWith('.') ||
+      !isEncodable(name)
+    ) {
+      return uploadError(
+        'name must be a plain file name: no " * : < > ? / \\ | characters, no leading or trailing spaces, not ending in "." and at most 255 characters, e.g. report.pdf.'
+      );
+    }
+    const behavior = conflictBehavior ?? 'fail';
+    if (!DRIVE_CONFLICT_BEHAVIORS.includes(behavior as never)) {
+      return uploadError('conflictBehavior must be fail, replace or rename.');
+    }
+    drive = { conflictBehavior: behavior as (typeof DRIVE_CONFLICT_BEHAVIORS)[number] };
+  } else if (conflictBehavior !== undefined) {
+    return uploadError('conflictBehavior applies only to OneDrive/SharePoint folder targets.');
+  }
+
+  const identityFromRequest = Boolean(authManager?.isOAuthModeEnabled() || getRequestTokens());
+  const requestToken = identityFromRequest
+    ? (getRequestTokens()?.accessToken ??
+      (await authManager?.getToken().catch(() => null)) ??
+      undefined)
+    : undefined;
+  if (identityFromRequest && !requestToken) {
+    return uploadError(
+      'No Graph access token is available for this request, so no upload URL can be minted.'
+    );
+  }
+  const accountModeError = await checkAccountParamInBearerMode(accountParam, authManager);
+  if (accountModeError) return uploadError(accountModeError);
+
+  let ticket: { id: string; expiresAtMs: number };
+  try {
+    const upload = {
+      name: cleanName,
+      contentType,
+      ...(contentId ? { contentId } : {}),
+      ...(drive ? { drive } : {}),
+    };
+    ticket = requestToken
+      ? minting.store.mintUploadWithToken(target, requestToken, upload)
+      : minting.store.mintUpload(target, accountParam, upload);
+  } catch (error) {
+    if (error instanceof TicketStoreFullError) return uploadError(error.message);
+    throw error;
+  }
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify({
+          uploadUrl: buildAttachmentUrl(minting.config, ticket.id),
+          method: 'PUT',
+          expiresAt: new Date(ticket.expiresAtMs).toISOString(),
+          singleUse: true,
+          maxBytes: MAX_UPLOAD_BYTES,
+          ...(drive && { conflictBehavior: drive.conflictBehavior }),
+          note: 'PUT the raw file bytes with a Content-Length (e.g. curl -T <file> "<uploadUrl>"). Served by this server; valid for one upload until it expires.',
+        }),
+      },
+    ],
+  };
+}
+
+// A single mail or event attachment's bytes: the only /$value targets $select accepts.
+const MAIL_EVENT_ATTACHMENT_VALUE =
+  /^(?:\/me|\/users\/[^/]+|\/groups\/[^/]+)\/(?:messages|events)\/[^/]+\/attachments\/[^/]+\/\$value$/;
+
+/**
+ * Graph answers an attachment's /$value with application/octet-stream, so read the real name
+ * and type from the attachment resource for the redemption route to serve. Any failure is
+ * swallowed: the mint carries on exactly as it did without a probe.
+ */
+async function probeAttachment(
+  target: string,
+  graphClient: Pick<GraphClient, 'makeRequest'>,
+  accessToken: string | undefined
+): Promise<DownloadProbe> {
+  if (!MAIL_EVENT_ATTACHMENT_VALUE.test(target)) return {};
+  try {
+    const meta = (await graphClient.makeRequest(
+      `${target.slice(0, -'/$value'.length)}?$select=name,contentType`,
+      { accessToken }
+    )) as { name?: unknown; contentType?: unknown } | null;
+    return {
+      ...(typeof meta?.contentType === 'string' && { probedContentType: meta.contentType }),
+      ...(typeof meta?.name === 'string' && { probedName: meta.name }),
+    };
+  } catch {
+    return {};
+  }
+}
+
+async function mintDownloadUrl(
+  target: string,
+  accountParam: string | undefined,
+  authManager: AuthManager | undefined,
+  // Given only for mail and event attachments: the client the content type is probed with.
+  probeWith?: Pick<GraphClient, 'makeRequest'>,
+  // Given for drive items, whose metadata the caller already read: the name and type for
+  // the redemption route, and the fields to return next to the URL.
+  known?: { probe: DownloadProbe; fields: Record<string, unknown> }
+): Promise<CallToolResult | null> {
+  const minting = getAttachmentMinting();
+  if (!minting) return null;
+
+  // When this request's Graph identity comes from the caller rather than from this
+  // server's own token cache, the ticket keeps the token `download-bytes` would
+  // have read with. Redemption arrives later with no Authorization header, so a
+  // lookup in the cache would fetch as whatever account this server has cached:
+  // ask under one identity, fetch under another.
+  //
+  // **Both halves of this predicate are load-bearing.** `isOAuthModeEnabled()`
+  // is true only for MS365_MCP_OAUTH_TOKEN and the oauth-provider path; it is
+  // *false* in plain `--http` bearer mode and in `--obo`, both of which still
+  // run the tool inside a request context holding the caller's token (already
+  // exchanged, under OBO). Every other token site in this file pairs these two
+  // checks (see the `getRequestTokens()` guards below); this one must too.
+  const identityFromRequest = Boolean(authManager?.isOAuthModeEnabled() || getRequestTokens());
+  // getToken() throws rather than returning nothing, and the early mint sites sit
+  // outside the tool's own try, so a throw here would surface as a protocol error.
+  const requestToken = identityFromRequest
+    ? (getRequestTokens()?.accessToken ??
+      (await authManager?.getToken().catch(() => null)) ??
+      undefined)
+    : undefined;
+  if (identityFromRequest && !requestToken) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            error:
+              'No Graph access token is available for this request, so no download URL can be minted. Use download-bytes.',
+          }),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  // Validated here rather than left to the caller further down: the three
+  // early mint sites return before the tool reaches its own account check, so
+  // without this an unusable `account` would be baked into a ticket and only
+  // surface as a 502 at redemption, long after the agent could act on it.
+  const accountModeError = await checkAccountParamInBearerMode(accountParam, authManager);
+  if (accountModeError) {
+    return {
+      content: [{ type: 'text', text: JSON.stringify({ error: accountModeError }) }],
+      isError: true,
+    };
+  }
+
+  // The suffix checks at the call sites say nothing about what precedes the suffix, so a
+  // fragment or a dot segment gets past them and resolves elsewhere once the path is
+  // concatenated onto the Graph origin. Refuse rather than mint a ticket that names one
+  // resource and fetches another.
+  if (!isPlainGraphPath(target)) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            error:
+              'target must be a plain relative Graph path: no fragment, no query, no "." or ".." segments, and no percent-encoded separators.',
+          }),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  // After the plain-path check, so a target whose checked and fetched paths diverge is
+  // refused before Graph is asked about it.
+  const probe = known
+    ? known.probe
+    : probeWith
+      ? await probeAttachment(
+          target,
+          probeWith,
+          requestToken ??
+            (await authManager?.getTokenForAccount(accountParam).catch(() => undefined))
+        )
+      : {};
+  let ticket: { id: string; expiresAtMs: number };
+  try {
+    ticket = requestToken
+      ? minting.store.mintWithToken(target, requestToken, undefined, probe)
+      : minting.store.mint(target, accountParam, undefined, probe);
+  } catch (error) {
+    if (error instanceof TicketStoreFullError) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: error.message }) }],
+        isError: true,
+      };
+    }
+    throw error;
+  }
+
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify({
+          downloadUrl: buildAttachmentUrl(minting.config, ticket.id),
+          ...known?.fields,
+          expiresAt: new Date(ticket.expiresAtMs).toISOString(),
+          singleUse: true,
+          note: 'Served by this server, not by Microsoft Graph. Valid for one fetch until it expires.',
+        }),
+      },
+    ],
+  };
+}
+
+// A caller-settable Accept value, as zod. regex and max stay declarative (not .refine)
+// so the published JSON schema carries pattern and maxLength. An empty string means unset.
+function acceptValueSchema(): z.ZodTypeAny {
+  return z
+    .string()
+    .max(ACCEPT_VALUE_MAX_LENGTH)
+    .regex(ACCEPT_VALUE_PATTERN, ACCEPT_VALUE_ERROR)
+    .optional();
+}
+
+// Optional Accept param shared by the byte-download utilities.
+function acceptParamSchema(): z.ZodTypeAny {
+  return acceptValueSchema().describe(
+    'Optional Accept header. Set only when Graph asks for another format ' +
+      '(transcript content: application/vnd.microsoft.graph.transcript+text).'
+  );
+}
+
+// Re-checked in execute: execute can be reached without schema parsing (execute-tool).
+// Returns the error result for an invalid value, undefined when accept is unset or valid.
+function invalidAcceptResult(accept: unknown): CallToolResult | undefined {
+  if (accept == null || (typeof accept === 'string' && isAcceptValue(accept))) {
+    return undefined;
+  }
+  return {
+    content: [{ type: 'text', text: JSON.stringify({ error: ACCEPT_VALUE_ERROR }) }],
+    isError: true,
+  };
+}
+
 export const UTILITY_TOOLS: readonly UtilityTool[] = [
+  {
+    name: 'get-upload-url',
+    method: 'PUT',
+    path: 'tool:get-upload-url',
+    searchKeywords:
+      'upload attachment attach file draft email attach file event large attachment send file out-of-band upload url upload onedrive file upload sharepoint file',
+    description:
+      'Mint a short-lived, single-use URL that this server serves for uploading a file as an attachment to a draft message or an event, or as a file in a OneDrive/SharePoint folder, so the bytes go straight from the caller to Microsoft Graph instead of passing as base64 through the agent context. target is the attachments collection of the item: /me/messages/{message-id}/attachments (a draft; create it first) or /me/events/{event-id}/attachments; or a drive folder: /me/drive/root, /me/drive/items/{folder-id}, /drives/{drive-id}/items/{folder-id}, /sites/{site-id}/drive/items/{folder-id}. PUT the raw file bytes to the returned uploadUrl with a Content-Length (e.g. curl -T file "<uploadUrl>"); the response confirms the upload. Up to 150 MB. Pass contentId to attach inline, e.g. a signature picture the HTML body shows with <img src="cid:<contentId>">. For a drive folder, conflictBehavior says what happens when the name is taken (default fail; contentId does not apply). Requires --enable-attachment-urls. Returns { uploadUrl, method, expiresAt, singleUse, maxBytes, conflictBehavior? }.',
+    readOnlyHint: false,
+    openWorldHint: true,
+    buildSchema: (ctx) => {
+      const schema: Record<string, z.ZodTypeAny> = {
+        target: z
+          .string()
+          .describe(
+            'Attachments collection of a draft message or an event, e.g. /me/messages/{message-id}/attachments, /me/events/{event-id}/attachments, or /users/{user-id}/messages/{message-id}/attachments for another mailbox. Or a OneDrive/SharePoint folder: /me/drive/root, /me/drive/items/{folder-id}, /drives/{drive-id}/items/{folder-id}, /sites/{site-id}/drive/items/{folder-id}.'
+          ),
+        name: z
+          .string()
+          .describe(
+            'File name as it will be stored, e.g. report.pdf: the attachment name, or the file name in the drive folder.'
+          ),
+        contentType: z
+          .string()
+          .optional()
+          .describe(
+            'MIME type of the file, e.g. application/pdf. Defaults to application/octet-stream.'
+          ),
+        contentId: contentIdSchema,
+        conflictBehavior: z
+          .enum(DRIVE_CONFLICT_BEHAVIORS)
+          .optional()
+          .describe(
+            'Drive folder targets only: what happens when the folder already has a file with this name. fail (default), replace, or rename.'
+          ),
+      };
+      if (ctx.multiAccount) {
+        schema['account'] = z
+          .string()
+          .optional()
+          .describe(
+            'Account to use when multiple Microsoft accounts are configured. Required when multiple accounts exist (see list-accounts).'
+          );
+      }
+      return schema;
+    },
+    execute: async (params, { authManager }) => {
+      const target = params.target;
+      const name = params.name;
+      if (typeof target !== 'string' || target.length === 0) {
+        return uploadError('target is required and must be a non-empty string.');
+      }
+      if (typeof name !== 'string' || name.length === 0) {
+        return uploadError('name is required and must be a non-empty string.');
+      }
+      const contentType =
+        typeof params.contentType === 'string' && params.contentType.length > 0
+          ? params.contentType
+          : 'application/octet-stream';
+      return mintUploadUrl(
+        target,
+        name,
+        contentType,
+        params.account as string | undefined,
+        authManager,
+        optionalContentId(params.contentId),
+        params.conflictBehavior === '' ? undefined : params.conflictBehavior
+      );
+    },
+  },
+  {
+    name: 'upload-attachment-from-file',
+    method: 'POST',
+    path: 'tool:upload-attachment-from-file',
+    searchKeywords:
+      'attach local file upload file from disk attach file path draft email attach file event attachment without base64',
+    description:
+      'Attach a local file on the server to a draft message or an event, read straight from disk instead of passing as base64 through the agent context. target is the attachments collection, e.g. /me/messages/{message-id}/attachments or /me/events/{event-id}/attachments. Files up to 150 MB; the server picks an inline upload or an upload session by size. filePath must be absolute and inside a directory listed in MS365_MCP_UPLOAD_DIRS. stdio mode, or HTTP with --http-local-file-tools.',
+    readOnlyHint: false,
+    openWorldHint: true,
+    stdioOnly: true,
+    enabled: () => getUploadDirs().length > 0,
+    buildSchema: (ctx) => {
+      const schema: Record<string, z.ZodTypeAny> = {
+        target: z
+          .string()
+          .describe(
+            'Attachments collection of a draft message or an event, e.g. /me/messages/{message-id}/attachments, /me/events/{event-id}/attachments, or /users/{user-id}/messages/{message-id}/attachments for another mailbox.'
+          ),
+        filePath: z
+          .string()
+          .describe(
+            "Absolute path of the file on the server's filesystem, e.g. /Users/me/documents/invitation.pdf. Must be inside a directory the server allows uploads from."
+          ),
+        name: z
+          .string()
+          .optional()
+          .describe(
+            'Attachment file name as the recipient will see it. Defaults to the file name of filePath.'
+          ),
+        contentType: z
+          .string()
+          .optional()
+          .describe(
+            'MIME type of the file, e.g. application/pdf. Defaults to application/octet-stream.'
+          ),
+        contentId: contentIdSchema,
+      };
+      if (ctx.multiAccount) {
+        schema['account'] = z
+          .string()
+          .optional()
+          .describe(
+            'Account to use when multiple Microsoft accounts are configured. Required when multiple accounts exist (see list-accounts).'
+          );
+      }
+      return schema;
+    },
+    execute: async (params, { graphClient, authManager }) => {
+      const target = params.target;
+      const filePath = params.filePath;
+      const accountParam = params.account as string | undefined;
+      if (typeof target !== 'string' || target.length === 0) {
+        return uploadError('target is required and must be a non-empty string.');
+      }
+      if (typeof filePath !== 'string' || filePath.length === 0) {
+        return uploadError('filePath is required and must be a non-empty string.');
+      }
+      if (!UPLOAD_TARGET.test(target) || !isPlainGraphPath(target)) {
+        return uploadError(UPLOAD_TARGET_ERROR);
+      }
+      const contentType =
+        typeof params.contentType === 'string' && params.contentType.length > 0
+          ? params.contentType
+          : 'application/octet-stream';
+      if (!UPLOAD_CONTENT_TYPE.test(contentType)) {
+        return uploadError('contentType must be a MIME type such as application/pdf.');
+      }
+      const contentId = optionalContentId(params.contentId);
+      if (contentId !== undefined && !UPLOAD_CONTENT_ID.test(contentId)) {
+        return uploadError(UPLOAD_CONTENT_ID_ERROR);
+      }
+      const name = cleanAttachmentName(
+        typeof params.name === 'string' && params.name.trim().length > 0
+          ? params.name
+          : path.basename(filePath)
+      );
+      if (!name) return uploadError('name is required.');
+
+      let file: UploadFile;
+      try {
+        file = await openUploadFile(filePath, getUploadDirs());
+      } catch (error) {
+        return uploadError((error as Error).message);
+      }
+      try {
+        if (file.size === 0) return uploadError('The file is empty.');
+        if (file.size > MAX_UPLOAD_BYTES) {
+          return uploadError(
+            `The file is ${file.size} bytes; the largest attachment is ${MAX_UPLOAD_BYTES} bytes.`
+          );
+        }
+        const accountModeError = await checkAccountParamInBearerMode(accountParam, authManager);
+        if (accountModeError) return uploadError(accountModeError);
+        let accountAccessToken: string | undefined;
+        if (authManager && !authManager.isOAuthModeEnabled() && !getRequestTokens()) {
+          accountAccessToken = await authManager.getTokenForAccount(accountParam);
+        }
+        const created = await uploadAttachment(
+          graphClient,
+          {
+            target,
+            name,
+            contentType,
+            size: file.size,
+            accessToken: accountAccessToken,
+            contentId,
+          },
+          // end pins the read to the size that was declared, should the file grow meanwhile
+          file.handle.createReadStream({
+            autoClose: false,
+            highWaterMark: 1024 * 1024,
+            end: file.size - 1,
+          })
+        );
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                name,
+                size: file.size,
+                ...(created.id ? { id: created.id } : {}),
+              }),
+            },
+          ],
+        };
+      } catch (error) {
+        const metadata = thrownErrorAuditFields(error);
+        return {
+          ...uploadError((error as Error).message),
+          ...(Object.keys(metadata).length > 0 ? { _meta: metadata } : {}),
+        };
+      } finally {
+        await file.handle.close();
+      }
+    },
+  },
   {
     name: 'parse-teams-url',
     method: 'POST',
@@ -282,11 +1934,197 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
     },
   },
   {
+    name: 'read-mail-text',
+    meOnly: true,
+    method: 'GET',
+    path: 'tool:read-mail-text',
+    searchKeywords:
+      'triage inbox skim many emails at once without quoted history signature footer tracking links',
+    description:
+      'Triage view of up to 20 mail messages at once, as text with the bulk junk removed: invisible padding, image placeholders and quoted reply history (forwards keep theirs). Links are kept: Safe Links, Proofpoint and Google redirects are unwrapped to the real address and tracking parameters (utm_* and similar) dropped; only an address still over 300 characters (a tracking redirect) is shortened to \u27e6link: domain\u27e7. Everything else (signatures, footers, whitespace) is left as the message has it; line endings become \\n and \u27e6 \u27e7 in the body itself appear as [ ]. Use get-mail-message for the raw body or the quoted thread. Give messageIds (up to 20), or folderId with optional top and filter or search for the newest messages in a folder. Each message is cut to maxChars characters (default 3,000; marked truncated: true): pass a larger maxChars, up to 300,000, for the whole of a long message; a body over 300,000 characters is cleaned only that far. If the whole result would exceed the server limit (MS365_MCP_READ_MAIL_TEXT_MAX_CHARS, default 80000) the call fails, listing the largest messages, instead of returning part of it. Returns [{ id, from, to, cc, subject, received, hasAttachments, text, chars, truncated }].',
+    readOnlyHint: true,
+    openWorldHint: true,
+    buildSchema: (ctx) => {
+      const schema: Record<string, z.ZodTypeAny> = {
+        messageIds: z
+          .array(z.string())
+          .max(MAIL_TEXT_MAX_IDS)
+          .optional()
+          .describe(
+            `Ids of the messages to read (max ${MAIL_TEXT_MAX_IDS}). Give messageIds or folderId, not both.`
+          ),
+        folderId: z
+          .string()
+          .optional()
+          .describe(
+            'Folder to read from: a well-known name (inbox, sentitems, drafts, archive, deleteditems, junkemail) or a folder id.'
+          ),
+        top: z
+          .number()
+          .int()
+          .min(1)
+          .max(MAIL_TEXT_MAX_TOP)
+          .optional()
+          .describe(
+            `With folderId: how many messages, newest first (default and max ${MAIL_TEXT_MAX_TOP}).`
+          ),
+        filter: z
+          .string()
+          .optional()
+          .describe(
+            "With folderId: OData $filter, e.g. receivedDateTime ge 2026-10-01T00:00:00Z or from/emailAddress/address eq 'a@example.com'."
+          ),
+        search: z
+          .string()
+          .optional()
+          .describe(
+            'With folderId: KQL search, e.g. from:paul subject:"quarterly report" (quoting is normalised as for list-mail-messages). Graph cannot combine it with filter.'
+          ),
+        maxChars: z
+          .number()
+          .int()
+          .min(1)
+          .max(MAIL_TEXT_MAX_INPUT_CHARS)
+          .optional()
+          .describe(
+            'Cut each message text to this many characters (marked truncated). Default 3,000; pass up to 300,000 for the whole of a long message (a body over 300,000 characters is cleaned only that far, also marked truncated).'
+          ),
+      };
+      if (ctx.multiAccount) {
+        schema['account'] = z
+          .string()
+          .optional()
+          .describe(
+            'Account to use when multiple Microsoft accounts are configured. Required when multiple accounts exist (see list-accounts).'
+          );
+      }
+      return schema;
+    },
+    execute: async (params, { graphClient, authManager }) => {
+      const fail = (error: string): CallToolResult => ({
+        content: [{ type: 'text', text: JSON.stringify({ error }) }],
+        isError: true,
+      });
+      // Discovery mode's execute-tool passes raw parameters (no zod), so validate here.
+      const invalid = validateMailTextArgs(params);
+      if (invalid) return fail(invalid);
+      const ids = params.messageIds as string[] | undefined;
+      const folderId = params.folderId as string | undefined;
+      const top = params.top as number | undefined;
+      const filter = params.filter as string | undefined;
+      const search = params.search as string | undefined;
+      const maxChars = (params.maxChars as number | undefined) ?? MAIL_TEXT_DEFAULT_MAX_CHARS;
+      const accountParam = params.account as string | undefined;
+      const envLimit = Number(process.env.MS365_MCP_READ_MAIL_TEXT_MAX_CHARS);
+      const limit =
+        Number.isInteger(envLimit) && envLimit > 0
+          ? envLimit
+          : MAIL_TEXT_DEFAULT_MAX_RESPONSE_CHARS;
+      try {
+        const accountModeError = await checkAccountParamInBearerMode(accountParam, authManager);
+        if (accountModeError) return fail(accountModeError);
+        let accessToken: string | undefined;
+        if (authManager && !authManager.isOAuthModeEnabled() && !getRequestTokens()) {
+          accessToken = await authManager.getTokenForAccount(accountParam);
+        }
+        const requestJson = async (
+          endpoint: string,
+          options: { method?: string; body?: string; headers?: Record<string, string> }
+        ): Promise<{ error?: CallToolResult; data?: Record<string, unknown> }> => {
+          const response = await graphClient.graphRequest(endpoint, {
+            ...options,
+            accessToken,
+            forceJsonOutput: true,
+          });
+          // graphRequest returns Graph HTTP errors as { isError: true }: pass them on.
+          if (response?.isError) return { error: response as CallToolResult };
+          const text = response?.content?.[0]?.text;
+          try {
+            return { data: JSON.parse(typeof text === 'string' ? text : '') };
+          } catch {
+            return { error: fail('Unexpected non-JSON response from Microsoft Graph.') };
+          }
+        };
+
+        let entries: Array<MailTextEntry | { id: string; error: string }>;
+        if (ids !== undefined) {
+          // One $batch for all ids; each sub-request asks Graph for a text body.
+          const requests = ids.map((id, i) => ({
+            id: String(i),
+            method: 'GET',
+            url: `/me/messages/${encodeURIComponent(id)}?$select=${MAIL_TEXT_SELECT}`,
+            headers: { Prefer: PREFER_TEXT_BODY },
+          }));
+          const r = await requestJson('/$batch', {
+            method: 'POST',
+            body: JSON.stringify({ requests }),
+            headers: { 'Content-Type': 'application/json' },
+          });
+          if (r.error) return r.error;
+          const responses = (r.data?.responses ?? []) as Array<{
+            id: string;
+            status: number;
+            body?: GraphMessage & { error?: { code?: string; message?: string } };
+          }>;
+          const byId = new Map(responses.map((x) => [x.id, x]));
+          entries = ids.map((id, i) => {
+            const x = byId.get(String(i));
+            if (!x) return { id, error: 'no response' };
+            if (x.status !== 200) {
+              const e = x.body?.error;
+              return {
+                id,
+                error:
+                  x.status === 404
+                    ? 'not found'
+                    : `${e?.code ?? x.status}: ${e?.message ?? ''}`.trim(),
+              };
+            }
+            return toMailTextEntry(x.body ?? {}, maxChars);
+          });
+        } else {
+          const queryParams: Record<string, string> = {
+            $select: MAIL_TEXT_SELECT,
+            $top: String(top ?? MAIL_TEXT_MAX_TOP),
+          };
+          if (filter !== undefined) queryParams['$filter'] = filter;
+          if (search !== undefined) {
+            // The same KQL quoting repair list-mail-messages gets.
+            queryParams['$search'] = search;
+            const searchError = normalizeSearchQueryParam(
+              queryParams,
+              '/me/mailFolders/{mailFolder-id}/messages',
+              'read-mail-text'
+            );
+            if (searchError) return searchError;
+          }
+          const r = await requestJson(
+            `/me/mailFolders/${encodeURIComponent(folderId as string)}/messages?${new URLSearchParams(queryParams)}`,
+            { headers: { Prefer: PREFER_TEXT_BODY } }
+          );
+          if (r.error) return r.error;
+          entries = ((r.data?.value ?? []) as GraphMessage[]).map((m) =>
+            toMailTextEntry(m, maxChars)
+          );
+        }
+        const text = JSON.stringify(entries);
+        if (text.length > limit) return fail(oversizeError(entries, text.length, limit));
+        return { content: [{ type: 'text', text }] };
+      } catch (error) {
+        return fail((error as Error).message);
+      }
+    },
+  },
+  {
     name: 'download-bytes',
     method: 'GET',
     path: 'tool:download-bytes',
     description:
+<<<<<<< HEAD
       'Download binary content from Microsoft Graph and return it as base64. Single tool for any binary read: drive file content, mail attachment, profile photo, Teams hosted content, meeting recording. Returns { contentType, encoding: "base64", contentLength, contentBytes }. Pass savePath to write the bytes to a local file instead; the response is then { savedTo, contentType, contentLength } with no base64 (use this whenever the file is needed on disk, e.g. to upload it elsewhere). For large drive/SharePoint file content, prefer get-download-url, which returns a pre-authenticated URL to stream bytes out-of-band instead of base64 through the agent context.',
+=======
+      'Download binary content from Microsoft Graph and return it as base64. Single tool for any binary read: drive file content, mail attachment, profile photo, Teams hosted content, meeting recording. Returns { contentType, encoding: "base64", contentLength, contentBytes }. For large drive/SharePoint file content, prefer get-download-url, which returns a pre-authenticated URL to stream bytes out-of-band instead of base64 through the agent context. With --enable-attachment-urls in HTTP mode, also prefer get-download-url for document reads from authenticated byte endpoints. With the server\'s blob output on, the bytes come back as a file resource instead (capped by the server\'s download limit); pass fileName to name it.',
+>>>>>>> upstream/main
     readOnlyHint: true,
     openWorldHint: true,
     buildSchema: (ctx) => {
@@ -302,6 +2140,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
               '/teams/{team-id}/channels/{channel-id}/messages/{chatMessage-id}/hostedContents/{chatMessageHostedContent-id}/$value (Teams channel hosted content). ' +
               'For meeting recordings, use get-meeting-recording-content where available; Microsoft Graph returns authenticated recording bytes, not a pre-authenticated download URL.'
           ),
+<<<<<<< HEAD
         savePath: z
           .string()
           .optional()
@@ -312,6 +2151,15 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
           .boolean()
           .optional()
           .describe('With savePath: replace the file if it already exists. Defaults to false.'),
+=======
+        fileName: z
+          .string()
+          .optional()
+          .describe(
+            'Name of the file, used as the last segment of the returned resource URI when the server runs with blob output. Optional.'
+          ),
+        accept: acceptParamSchema(),
+>>>>>>> upstream/main
       };
       if (ctx.multiAccount) {
         schema['account'] = z
@@ -323,7 +2171,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       }
       return schema;
     },
-    execute: async (params, { graphClient, authManager }) => {
+    execute: async (params, { graphClient, authManager, userFields }) => {
       const target = params.target;
       const accountParam = params.account as string | undefined;
       if (typeof target !== 'string' || target.length === 0) {
@@ -351,6 +2199,13 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
           isError: true,
         };
       }
+      const alteredTarget = unalteredTargetError(target);
+      if (alteredTarget) return alteredTarget;
+      const restrictedTarget = userProfilePassthroughError(target, userFields);
+      if (restrictedTarget) return restrictedTarget;
+      const acceptError = invalidAcceptResult(params.accept);
+      if (acceptError) return acceptError;
+      const accept = params.accept as string | undefined;
       try {
         const accountModeError = await checkAccountParamInBearerMode(accountParam, authManager);
         if (accountModeError) {
@@ -363,6 +2218,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         if (authManager && !authManager.isOAuthModeEnabled() && !getRequestTokens()) {
           accountAccessToken = await authManager.getTokenForAccount(accountParam);
         }
+<<<<<<< HEAD
         const savePath = params.savePath as string | undefined;
         if (savePath === undefined) {
           // rawResponse keeps the body byte-faithful: binary stays base64 and a
@@ -433,10 +2289,214 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
             },
           ],
         };
+=======
+        // This tool's contract is the bytes, base64-encoded, whatever Graph says the
+        // type is. forceBinary makes the client read the body with arrayBuffer() for
+        // every Content-Type; without it only the isBinaryContentType allowlist is
+        // read raw, and an application/msword or application/rtf attachment is
+        // decoded as UTF-8 text with every invalid sequence replaced by U+FFFD —
+        // unrecoverable. rawResponse is kept for the JSON-body case (issue #546) but
+        // is not reached while forceBinary is set.
+        // With blob output on, the same bytes come back as a file resource, capped like
+        // the typed file tools.
+        const blob = isBlobOutputEnabled()
+          ? {
+              maxBytes: getBlobMaxBytes(),
+              blobOutput: {
+                fileName: typeof params.fileName === 'string' ? params.fileName : undefined,
+              },
+            }
+          : {};
+        return await graphClient.graphRequest(target, {
+          accessToken: accountAccessToken,
+          rawResponse: true,
+          forceBinary: true,
+          ...blob,
+          ...(accept ? { headers: { Accept: accept } } : {}),
+        });
+>>>>>>> upstream/main
       } catch (error) {
         return {
           content: [{ type: 'text', text: JSON.stringify({ error: (error as Error).message }) }],
           isError: true,
+        };
+      }
+    },
+  },
+  {
+    name: 'download-bytes-to-file',
+    method: 'GET',
+    path: 'tool:download-bytes-to-file',
+    searchKeywords:
+      'save to disk save to file write file to disk save attachment to disk save recording to disk write bytes to local file output path',
+    // Front-loaded on purpose: the discovery search index caps a tool's
+    // description at ~40 tokens, so the OneDrive/SharePoint guidance below
+    // sits past the cap. That keeps the hint for the reading LLM while letting
+    // get-download-url own the high-signal "drive"/"sharepoint" search terms.
+    description:
+      'Write authenticated Microsoft Graph byte content to a local file on the server, returning { path, contentType, bytesWritten } instead of base64. An out-of-band way to save mail attachments and meeting recordings. With --enable-attachment-urls in HTTP mode, prefer get-download-url to hand their bytes to an external downloader or converter. Also handles profile photos and Teams hosted content. Writes to an absolute outputPath and never overwrites an existing file. stdio mode, or HTTP with --http-local-file-tools. For OneDrive or SharePoint file content, get-download-url is preferred — it returns a pre-authenticated URL for fully out-of-band download without the server fetching the bytes.',
+    readOnlyHint: true,
+    openWorldHint: true,
+    stdioOnly: true,
+    buildSchema: (ctx) => {
+      const schema: Record<string, z.ZodTypeAny> = {
+        target: z
+          .string()
+          .describe(
+            'Relative Microsoft Graph path starting with "/". Common paths: ' +
+              '/drives/{drive-id}/items/{driveItem-id}/content (drive file content); ' +
+              '/me/messages/{message-id}/attachments/{attachment-id}/$value (mail attachment, list-mail-attachments returns the IDs); ' +
+              '/me/photo/$value or /users/{user-id}/photo/$value (profile photo); ' +
+              '/chats/{chat-id}/messages/{chatMessage-id}/hostedContents/{chatMessageHostedContent-id}/$value (Teams chat hosted content, list-chat-message-hosted-contents returns the IDs); ' +
+              '/teams/{team-id}/channels/{channel-id}/messages/{chatMessage-id}/hostedContents/{chatMessageHostedContent-id}/$value (Teams channel hosted content). ' +
+              'For meeting recordings, use get-meeting-recording-content where available; Microsoft Graph returns authenticated recording bytes, not a pre-authenticated download URL.'
+          ),
+        outputPath: z
+          .string()
+          .describe(
+            "Absolute path on the server's filesystem where the bytes are written, e.g. /Users/me/downloads/invoice.pdf. Must be absolute; relative paths are rejected. The parent directory must already exist, and an existing file is never overwritten (the call errors if outputPath already exists)."
+          ),
+        accept: acceptParamSchema(),
+      };
+      if (ctx.multiAccount) {
+        schema['account'] = z
+          .string()
+          .optional()
+          .describe(
+            'Account to use when multiple Microsoft accounts are configured. Required when multiple accounts exist (see list-accounts).'
+          );
+      }
+      return schema;
+    },
+    execute: async (params, { graphClient, authManager, userFields }) => {
+      const target = params.target;
+      const outputPath = params.outputPath;
+      const accountParam = params.account as string | undefined;
+      if (typeof target !== 'string' || target.length === 0) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ error: 'target is required and must be a non-empty string.' }),
+            },
+          ],
+          isError: true,
+        };
+      }
+      if (!target.startsWith('/')) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                error:
+                  'target must be a relative Microsoft Graph path starting with "/", e.g. /me/photo/$value or /drives/{drive-id}/items/{driveItem-id}/content. Absolute URLs are not accepted; if you have an @microsoft.graph.downloadUrl, use the equivalent /content or /$value path instead (Graph 302-redirects to the same bytes).',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+      if (typeof outputPath !== 'string' || outputPath.length === 0) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                error: 'outputPath is required and must be a non-empty string.',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+      const alteredTarget = unalteredTargetError(target);
+      if (alteredTarget) return alteredTarget;
+      const restrictedTarget = userProfilePassthroughError(target, userFields);
+      if (restrictedTarget) return restrictedTarget;
+      const acceptError = invalidAcceptResult(params.accept);
+      if (acceptError) return acceptError;
+      const accept = params.accept as string | undefined;
+      if (!path.isAbsolute(outputPath)) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                error: `outputPath must be an absolute path, e.g. /Users/me/downloads/file.ext. Received: ${outputPath}`,
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+      // downloadToFile's wx is the real no-overwrite guard; this just gives a
+      // friendlier "already exists" error before we bother calling Graph.
+      let fileExists = false;
+      try {
+        await access(outputPath);
+        fileExists = true;
+      } catch {
+        // ENOENT (and any other access error) means the file isn't readable/there;
+        // let the write attempt surface the real problem.
+      }
+      if (fileExists) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ error: `file already exists at ${outputPath}` }),
+            },
+          ],
+          isError: true,
+        };
+      }
+      try {
+        const accountModeError = await checkAccountParamInBearerMode(accountParam, authManager);
+        if (accountModeError) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ error: accountModeError }) }],
+            isError: true,
+          };
+        }
+        let accountAccessToken: string | undefined;
+        if (authManager && !authManager.isOAuthModeEnabled() && !getRequestTokens()) {
+          accountAccessToken = await authManager.getTokenForAccount(accountParam);
+        }
+        // Stream to disk instead of buffering: makeRequest holds the whole file
+        // in memory as base64, which dies on big recordings (V8 max string length).
+        const result = await graphClient.downloadToFile(target, outputPath, {
+          accessToken: accountAccessToken,
+          ...(accept ? { headers: { Accept: accept } } : {}),
+        });
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                path: outputPath,
+                contentType: result.contentType,
+                bytesWritten: result.contentLength,
+              }),
+            },
+          ],
+          // response_bytes must describe the file written, not this receipt.
+          // Streaming to disk means the payload never appears in the response,
+          // so without this the most extraction-shaped tool in the server would
+          // audit a 250MB download at the size of an error message.
+          _meta: {
+            ...(result.httpStatus !== undefined ? { http_status: result.httpStatus } : {}),
+            ...(typeof result.contentLength === 'number'
+              ? { response_bytes: result.contentLength }
+              : {}),
+          },
+        };
+      } catch (error) {
+        const metadata = thrownErrorAuditFields(error);
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ error: (error as Error).message }) }],
+          isError: true,
+          ...(Object.keys(metadata).length > 0 ? { _meta: metadata } : {}),
         };
       }
     },
@@ -448,7 +2508,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
     searchKeywords:
       'download file download drive file download onedrive file sharepoint file download large drive file large sharepoint file large file out-of-band download pre-authenticated url',
     description:
-      'Resolve a short-lived, pre-authenticated download URL for Microsoft Graph binary content that exposes one (drive/SharePoint file content). The returned URL streams the bytes with NO Authorization header, so the client can fetch it straight to disk (e.g. curl) without round-tripping base64 through the agent context. Prefer this over download-bytes for any file above a few KB or any bulk download. Returns { downloadUrl, name?, size?, contentType? }. NOTE: mail file attachments (/messages/{id}/attachments/{id}/$value) and meeting recordings do NOT expose a pre-authenticated URL — Graph offers no such link for them; use download-bytes for small ones.',
+      'Resolve a short-lived, pre-authenticated download URL for Microsoft Graph binary content that exposes one (drive/SharePoint file content). The returned URL streams the bytes with NO Authorization header, so the client can fetch it straight to disk (e.g. curl) without round-tripping base64 through the agent context. Prefer this over download-bytes for any file above a few KB or any bulk download. Returns { downloadUrl, name?, size?, contentType? }. Mail file attachments (/messages/{id}/attachments/{id}/$value), meeting recordings and other $value byte endpoints have no pre-authenticated URL from Graph itself, but call this tool for them anyway: a server running with --enable-attachment-urls mints its own single-use URL for them, and one without it answers with the reason and points at download-bytes. With --enable-attachment-urls, drive files get a short single-use URL from this server as well, instead of the long one from Graph.',
     readOnlyHint: true,
     openWorldHint: true,
     buildSchema: (ctx) => {
@@ -459,7 +2519,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
             'Relative Microsoft Graph path starting with "/". Either a driveItem content path or the item path itself, e.g. ' +
               '/drives/{drive-id}/items/{driveItem-id}/content, /me/drive/items/{driveItem-id}/content, ' +
               'or /sites/{site-id}/drive/items/{driveItem-id}. ' +
-              'A trailing /content is optional and is stripped automatically for drive items. Mail attachment $value paths and meeting recordings are not supported (Graph exposes no pre-authenticated URL for them).'
+              'A trailing /content is optional and is stripped automatically for drive items. Mail attachment $value paths and meeting recordings are accepted on a server running with --enable-attachment-urls.'
           ),
       };
       if (ctx.multiAccount) {
@@ -472,7 +2532,7 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       }
       return schema;
     },
-    execute: async (params, { graphClient, authManager }) => {
+    execute: async (params, { graphClient, authManager, userFields }) => {
       const target = params.target;
       const accountParam = params.account as string | undefined;
       if (typeof target !== 'string' || target.length === 0) {
@@ -500,6 +2560,10 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
           isError: true,
         };
       }
+      const alteredTarget = unalteredTargetError(target);
+      if (alteredTarget) return alteredTarget;
+      const restrictedTarget = userProfilePassthroughError(target, userFields);
+      if (restrictedTarget) return restrictedTarget;
       // Normalize: separate any query string and strip trailing slashes so the /content and
       // /$value suffix checks are robust to e.g. "/content/" or "/content?select=id".
       const queryIdx = target.indexOf('?');
@@ -528,6 +2592,22 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         /^\/groups\/[^/]+\/messages\/[^/]+\/attachments\//.test(pathPart) ||
         /^\/groups\/[^/]+\/events\/[^/]+\/attachments\//.test(pathPart)
       ) {
+        if (getAttachmentMinting() && !pathPart.endsWith('/$value')) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  error:
+                    'Only the /$value byte endpoint can be minted a download URL: end target with /$value, e.g. /me/messages/{message-id}/attachments/{attachment-id}/$value. The attachment resource itself returns JSON with base64 contentBytes.',
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
+        const minted = await mintDownloadUrl(pathPart, accountParam, authManager, graphClient);
+        if (minted) return minted;
         return {
           content: [
             {
@@ -548,6 +2628,22 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         ) ||
         /^\/communications\/calls\/[^/]+\/recordings\/[^/]+(?:\/content)?$/.test(pathPart)
       ) {
+        if (getAttachmentMinting() && !pathPart.endsWith('/content')) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  error:
+                    'Only the /content byte endpoint can be minted a download URL: end target with /content, e.g. /me/onlineMeetings/{meeting-id}/recordings/{recording-id}/content.',
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
+        const minted = await mintDownloadUrl(pathPart, accountParam, authManager);
+        if (minted) return minted;
         return {
           content: [
             {
@@ -563,6 +2659,8 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       }
       // Other /$value byte endpoints (profile photo, Teams hosted content) likewise have no URL.
       if (pathPart.endsWith('/$value')) {
+        const minted = await mintDownloadUrl(pathPart, accountParam, authManager);
+        if (minted) return minted;
         return {
           content: [
             {
@@ -628,6 +2726,9 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
         }
         const response = await graphClient.graphRequest(itemPath, {
           accessToken: accountAccessToken,
+          // We JSON.parse the metadata below, so force JSON - under --toon it'd be
+          // TOON and the parse would fail, masking a real item as "no download url".
+          forceJsonOutput: true,
         });
         // graphRequest swallows Graph HTTP errors and returns { isError: true } (see
         // graph-client.ts); surface the real error (401/403/404/429/...) instead of masking
@@ -645,7 +2746,49 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
           }
         }
         const downloadUrl = item?.['@microsoft.graph.downloadUrl'] as string | undefined;
+        const file = item?.file as { mimeType?: string } | undefined;
+        // With server-minted URLs on, drive files get this server's short link too: Graph's
+        // own URL is ~1,300 characters, too long for an agent that has to type it (#750).
+        if (getAttachmentMinting() && item && !item.folder) {
+          const name = typeof item.name === 'string' ? item.name : undefined;
+          const mimeType = typeof file?.mimeType === 'string' ? file.mimeType : undefined;
+          // Name the item by id, not by the path the caller gave: a path-addressed target
+          // such as root:/Q1 Report.pdf: is not a plain Graph path, and the id names exactly
+          // the item whose metadata was just read.
+          const driveId = (item.parentReference as { driveId?: unknown } | undefined)?.driveId;
+          const byId =
+            typeof driveId === 'string' && typeof item.id === 'string'
+              ? `/drives/${encodeURIComponent(driveId)}/items/${encodeURIComponent(item.id)}/content`
+              : `${itemPath}/content`;
+          const minted = await mintDownloadUrl(byId, accountParam, authManager, undefined, {
+            probe: {
+              ...(name && { probedName: name }),
+              ...(mimeType && { probedContentType: mimeType }),
+            },
+            fields: { name, size: item.size, contentType: mimeType },
+          });
+          if (minted) return minted;
+        }
+        if (getAttachmentMinting() && item?.folder) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  error:
+                    'target is a folder. get-download-url serves one file; list the folder and ask for each file.',
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
         if (!downloadUrl) {
+          // The metadata path carries no downloadUrl, but the bytes are still
+          // reachable at its /content sub-resource -- which is what a ticket
+          // has to name, since that is what the redemption route will GET.
+          const minted = await mintDownloadUrl(`${itemPath}/content`, accountParam, authManager);
+          if (minted) return minted;
           return {
             content: [
               {
@@ -657,9 +2800,9 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
               },
             ],
             isError: true,
+            _meta: response._meta,
           };
         }
-        const file = item?.file as { mimeType?: string } | undefined;
         return {
           content: [
             {
@@ -672,11 +2815,14 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
               }),
             },
           ],
+          _meta: response._meta,
         };
       } catch (error) {
+        const metadata = thrownErrorAuditFields(error);
         return {
           content: [{ type: 'text', text: JSON.stringify({ error: (error as Error).message }) }],
           isError: true,
+          ...(Object.keys(metadata).length > 0 ? { _meta: metadata } : {}),
         };
       }
     },
@@ -697,8 +2843,215 @@ function registerUtilityToolWithMcp(
       readOnlyHint: utility.readOnlyHint ?? true,
       openWorldHint: utility.openWorldHint ?? true,
     },
-    async (params) => utility.execute(params, ctx)
+    async (params) => executeUtilityTool(utility, ctx, params)
   );
+}
+
+// Every nested `body` field in the generated clients is an itemBody, so an @odata.type
+// naming it is the only one that belongs inside a body we just moved fields into
+function namesNestedBodyType(value: unknown): boolean {
+  return typeof value === 'string' && value.toLowerCase().endsWith('itembody');
+}
+
+// Dig out the object shape of a Body schema so flattened top-level params can be
+// matched against it (#569). z.lazy (chatMessage etc.) hides it behind def.getter
+function bodySchemaShape(schema: z.ZodTypeAny | undefined): Record<string, unknown> | null {
+  let current: z.ZodTypeAny | undefined = schema;
+  for (let i = 0; i < 10 && current; i++) {
+    if (current instanceof z.ZodObject) {
+      return current.shape as Record<string, unknown>;
+    }
+    const def = current.def as {
+      innerType?: z.ZodTypeAny;
+      in?: z.ZodTypeAny;
+      getter?: () => z.ZodTypeAny;
+    };
+    current = def.innerType ?? def.in ?? def.getter?.();
+  }
+  return null;
+}
+
+// SDK validation hands the handler the PARSED value, and strip-mode objects silently
+// drop unknown keys - loose keeps whatever the client sent. Memoized so every HTTP
+// request gets the same schema object, and its JSON Schema conversion stays cached.
+const lenientBodySchemas = new WeakMap<z.ZodTypeAny, z.ZodTypeAny>();
+function lenientBodySchema(schema: z.ZodTypeAny): z.ZodTypeAny {
+  let lenient = lenientBodySchemas.get(schema);
+  if (!lenient) {
+    lenient = buildLenientBodySchema(schema);
+    lenientBodySchemas.set(schema, lenient);
+  }
+  return lenient;
+}
+
+function buildLenientBodySchema(schema: z.ZodTypeAny): z.ZodTypeAny {
+  if (schema instanceof z.ZodObject) {
+    return schema.loose();
+  }
+  if (schema instanceof z.ZodOptional) {
+    return lenientBodySchema(schema.unwrap() as z.ZodTypeAny).optional();
+  }
+  if (schema instanceof z.ZodNullable) {
+    return lenientBodySchema(schema.unwrap() as z.ZodTypeAny).nullable();
+  }
+  if (schema instanceof z.ZodLazy) {
+    return z.lazy(() => lenientBodySchema(schema.unwrap() as z.ZodTypeAny));
+  }
+  return schema;
+}
+
+// Read-only in Graph - merging an echoed id/timestamp into a POST/PATCH body can 400
+const READ_ONLY_BODY_FIELDS = new Set([
+  'id',
+  'createdDateTime',
+  'lastModifiedDateTime',
+  'changeKey',
+]);
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * graph-batch forwards whatever subrequest URLs it is handed, so the user-field allowlist
+ * has to be applied to each one rather than to the batch as a whole. Returns the fields
+ * kept per subrequest id, which is what the matching subresponses are then projected to.
+ */
+function restrictBatchSubrequests(
+  body: unknown,
+  allowlist: string[]
+): { body: unknown; restricted: Map<string, string[]> } {
+  const restricted = new Map<string, string[]>();
+  let changed = false;
+  let parsed: unknown = body;
+  const wasString = typeof body === 'string';
+  if (wasString) {
+    try {
+      parsed = JSON.parse(body as string);
+    } catch {
+      return { body, restricted };
+    }
+  }
+  if (!isPlainObject(parsed) || !Array.isArray(parsed.requests)) return { body, restricted };
+
+  parsed.requests.forEach((request: unknown, index: number) => {
+    if (!isPlainObject(request) || typeof request.url !== 'string') return;
+    const method = typeof request.method === 'string' ? request.method.toUpperCase() : 'GET';
+    const enforcement = userFieldEnforcement(request.url);
+    if (method !== 'GET') return;
+    if (enforcement !== 'none') {
+      const { url, fields } = restrictUserFieldUrl(request.url, allowlist, enforcement);
+      request.url = url;
+      restricted.set(String(request.id ?? index), fields);
+      changed = true;
+      logger.info(`Restricting batch subrequest ${String(request.id ?? index)} to: ${fields}`);
+    } else if (shouldStripUserFieldExpand(request.url)) {
+      const url = stripUserFieldExpandFromUrl(request.url);
+      if (url !== request.url) {
+        request.url = url;
+        changed = true;
+        logger.info(`Removing $expand from batch subrequest ${String(request.id ?? index)}`);
+      }
+    }
+  });
+
+  if (!changed) return { body, restricted };
+  return { body: wasString ? JSON.stringify(parsed) : parsed, restricted };
+}
+
+function projectBatchSubresponses(data: unknown, restricted: Map<string, string[]>): unknown {
+  if (!isPlainObject(data) || !Array.isArray(data.responses)) return data;
+  return {
+    ...data,
+    responses: data.responses.map((subresponse: unknown) => {
+      if (!isPlainObject(subresponse)) return subresponse;
+      const fields = restricted.get(String(subresponse.id));
+      if (!fields) return subresponse;
+      return { ...subresponse, body: projectSelectedFields(subresponse.body, fields, true) };
+    }),
+  };
+}
+
+/**
+ * The byte-passthrough tools return whatever Graph sent, verbatim, so there is no
+ * projection step to enforce the allowlist in. A profile read through one of them has to
+ * be refused instead.
+ */
+function userProfilePassthroughError(
+  target: string,
+  userFields: string[] | undefined
+): CallToolResult | undefined {
+  if (userFields === undefined || !targetsUserProfile(target)) return undefined;
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify({
+          error: 'user_fields_restricted',
+          message:
+            'This deployment restricts which user profile fields may be returned, and this tool returns the response bytes verbatim. Use list-users, which applies the restriction.',
+        }),
+      },
+    ],
+    isError: true,
+  };
+}
+
+// Object.hasOwn, but tsconfig targets ES2020. Not `in` - that would match
+// toString/constructor through the prototype
+function hasOwn(obj: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+// JSON.stringify recurses, so a params object nested deeply enough overflows the stack -
+// on Node 20 well before Node 26. It runs before the try below, so an unguarded throw
+// escapes executeGraphTool entirely: the caller gets a protocol error instead of a tool
+// error, and no audit record is written at all. Nesting depth is caller-controlled.
+function describeParamsForLog(params: Record<string, unknown>): string {
+  try {
+    return JSON.stringify(params);
+  } catch (error) {
+    return `[unserializable: ${error instanceof Error ? error.name : 'unknown error'}]`;
+  }
+}
+
+// A quote inside an OData string literal is doubled, e.g. TimeZoneStandard='{TimeZoneStandard}'
+function escapeIfStringLiteral(template: string, names: string[], value: unknown): string {
+  const quoted = names.some((n) => template.includes(`'{${n}}'`) || template.includes(`':${n}'`));
+  return quoted ? String(value).replace(/'/g, "''") : String(value);
+}
+
+// A skipEncoding value goes in raw, so it must not bring path segments of its own. The one
+// that is a whole trailing segment (/sites/{site-id}:/{path}) is a path already, and there
+// it is the ":" ending path addressing that would start a new one.
+function rawValueAddsSegments(template: string, names: string[], value: string): boolean {
+  const isTail = names.some((n) => template.endsWith(`/{${n}}`) || template.endsWith(`/:${n}`));
+  return isTail ? value.includes(':') : value.includes('/');
+}
+
+function invalidPathParameter(message: string) {
+  return {
+    content: [
+      { type: 'text' as const, text: JSON.stringify({ error: 'invalid_path_parameter', message }) },
+    ],
+    isError: true,
+  };
+}
+
+// The download tools take a Graph path as given, and the checks on it read that string
+function unalteredTargetError(target: string) {
+  if (isUnalteredGraphPath(target.split('?')[0])) return undefined;
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify({
+          error: 'target must not contain "." or ".." segments, a fragment or a backslash.',
+        }),
+      },
+    ],
+    isError: true,
+  };
 }
 
 async function executeGraphTool(
@@ -706,14 +3059,46 @@ async function executeGraphTool(
   config: EndpointConfig | undefined,
   graphClient: GraphClient,
   params: Record<string, unknown>,
-  authManager?: AuthManager
+  authManager?: AuthManager,
+  userFields?: string[]
 ): Promise<CallToolResult> {
-  logger.info(`Tool ${tool.alias} called with params: ${JSON.stringify(params)}`);
+  logger.info(`Tool ${tool.alias} called with params: ${describeParamsForLog(params)}`);
+
+  if (
+    isConfirmGateEnabled() &&
+    isDestructiveOperation(tool.method, config) &&
+    params.confirm !== true
+  ) {
+    logger.warn(
+      `Refusing destructive tool ${tool.alias} (${tool.method.toUpperCase()}): missing confirm: true`
+    );
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            error: 'confirmation_required',
+            tool: tool.alias,
+            method: tool.method.toUpperCase(),
+            destructive: true,
+            message:
+              'This tool modifies user data. Re-call with parameter "confirm": true after the user has explicitly approved the operation.',
+          }),
+        },
+      ],
+      isError: true,
+    };
+  }
 
   const requestId = randomUUID();
   const startTime = Date.now();
   const upn = getUserIdentityForAudit(getRequestTokens()?.accessToken);
   const httpMethod = tool.method.toUpperCase();
+  let targetResource: AuditTargetResource | undefined;
+  // Hoisted alongside targetResource so the catch-path audit can still report
+  // recipients. A send that times out or trips the breaker is exactly the
+  // ambiguous case: a thrown request is not proof that nothing was delivered.
+  let body: unknown = null;
 
   try {
     const accountParam = params.account as string | undefined;
@@ -753,13 +3138,29 @@ async function executeGraphTool(
     let path = tool.path;
     const queryParams: Record<string, string> = {};
     const headers: Record<string, string> = {};
-    let body: unknown = null;
+
+    // Body fields the client passed as top-level params (#569) - merged into the
+    // request body after the loop
+    const bodyShape = bodySchemaShape(
+      parameterDefinitions.find((p) => p.type === 'Body')?.schema as z.ZodTypeAny | undefined
+    );
+    const strayBodyFields: Record<string, unknown> = {};
+    // Set when the caller's body was reshaped because it held a nested field (an itemBody)
+    // rather than the entity itself - then the caller never wrote the entity, so flattened
+    // siblings are still its intended fields even on PATCH (#731)
+    let bodyRepaired = false;
+    const memberNameFilter =
+      config?.nameFilter && typeof params.name === 'string' ? params.name : undefined;
 
     for (const [paramName, paramValue] of Object.entries(params)) {
+      if (paramName === 'fileName' && config?.blobOutput) continue;
+      if (paramName === 'name' && config?.nameFilter) continue;
+      if (paramName === 'token' && config?.deltaToken) continue;
       // Skip control parameters - not part of the Microsoft Graph API
       if (
         [
           'account',
+          'confirm',
           'fetchAllPages',
           'includeHeaders',
           'excludeResponse',
@@ -778,15 +3179,17 @@ async function executeGraphTool(
         'expand',
         'orderby',
         'skip',
+        'skiptoken',
         'top',
         'count',
         'search',
         'format',
       ];
       // Handle both "top" and "$top" formats - strip $ if present, then re-add it
-      const normalizedParamName = paramName.startsWith('$') ? paramName.slice(1) : paramName;
-      const isOdataParam = odataParams.includes(normalizedParamName.toLowerCase());
-      const fixedParamName = isOdataParam ? `$${normalizedParamName.toLowerCase()}` : paramName;
+      const bareParamName = paramName.startsWith('$') ? paramName.slice(1) : paramName;
+      const isOdataParam = odataParams.includes(bareParamName.toLowerCase());
+      const normalizedParamName = isOdataParam ? bareParamName.toLowerCase() : bareParamName;
+      const fixedParamName = isOdataParam ? `$${normalizedParamName}` : paramName;
       // Convert kebab-case param names to camelCase for path param matching.
       // endpoints.json uses {message-id} but hack.ts extracts :messageId (camelCase) from the path.
       // LLMs may pass "message-id" (kebab) — we normalize so both forms work.
@@ -798,8 +3201,36 @@ async function executeGraphTool(
         (p) =>
           p.name === paramName ||
           p.name === camelCaseParamName ||
-          (isOdataParam && p.name === normalizedParamName)
+          (isOdataParam && p.name.replace(/^\$/, '').toLowerCase() === normalizedParamName)
       );
+
+      // execute-tool and passthrough inputs must follow the same contract as
+      // discovery and normal registration.
+      const isQuery = paramDef?.type === 'Query' || isOdataParam;
+      if (isQuery && paramValue != null && paramValue !== '') {
+        const schema = queryParameterSchema(
+          normalizedParamName,
+          paramDef?.schema ?? z.any(),
+          config
+        );
+        if (!schema || !schema.safeParse(paramValue).success) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  error: 'invalid_query_parameter',
+                  parameter: fixedParamName,
+                  message: schema
+                    ? 'Value does not match the query contract. Check get-tool-schema.'
+                    : 'This endpoint does not support this query parameter.',
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
 
       if (paramDef) {
         switch (paramDef.type) {
@@ -810,17 +3241,27 @@ async function executeGraphTool(
             // and commonly appears in Microsoft Graph base64-encoded resource IDs.
             // Without this, IDs like "AAMk...AAA=" become "AAMk...AAA%3D" causing 404 errors.
             // First we encode, then unencode. Crazy, check out https://github.com/Softeria/ms-365-mcp-server/issues/245
+            const names = [paramName, camelCaseParamName];
+            if (shouldSkipEncoding && rawValueAddsSegments(tool.path, names, `${paramValue}`)) {
+              return invalidPathParameter(
+                `'${paramName}' cannot add path segments to this endpoint: no "/" in a value, and no ":" in a site path.`
+              );
+            }
             const encodedValue = shouldSkipEncoding
               ? (paramValue as string)
-              : encodeURIComponent(paramValue as string).replace(/%3D/g, '=');
+              : encodeURIComponent(escapeIfStringLiteral(tool.path, names, paramValue)).replace(
+                  /%3D/g,
+                  '='
+                );
 
             // Replace both the original param name and the camelCase variant
             // to handle {message-id} (endpoints.json) and :messageId (generated client) formats
+            // A function, so "$`" and "$'" in a raw value are not replacement patterns
             path = path
-              .replace(`{${paramName}}`, encodedValue)
-              .replace(`:${paramName}`, encodedValue)
-              .replace(`{${camelCaseParamName}}`, encodedValue)
-              .replace(`:${camelCaseParamName}`, encodedValue);
+              .replace(`{${paramName}}`, () => encodedValue)
+              .replace(`:${paramName}`, () => encodedValue)
+              .replace(`{${camelCaseParamName}}`, () => encodedValue)
+              .replace(`:${camelCaseParamName}`, () => encodedValue);
             break;
           }
 
@@ -841,6 +3282,7 @@ async function executeGraphTool(
                     `Auto-corrected parameter '${paramName}': AI passed nested field directly, wrapped it as {${paramName}: ...}`
                   );
                   body = wrapped;
+                  bodyRepaired = true;
                 } else {
                   body = paramValue;
                 }
@@ -867,30 +3309,161 @@ async function executeGraphTool(
       ) {
         // Fallback: path param not declared in tool.parameters (generated client omits them).
         // Replace placeholder directly so the URL is valid.
-        const encodedValue = encodeURIComponent(paramValue as string).replace(/%3D/g, '=');
+        const encodedValue = encodeURIComponent(
+          escapeIfStringLiteral(tool.path, [paramName, camelCaseParamName], paramValue)
+        ).replace(/%3D/g, '=');
         path = path
-          .replace(`{${paramName}}`, encodedValue)
-          .replace(`:${paramName}`, encodedValue)
-          .replace(`{${camelCaseParamName}}`, encodedValue)
-          .replace(`:${camelCaseParamName}`, encodedValue);
+          .replace(`{${paramName}}`, () => encodedValue)
+          .replace(`:${paramName}`, () => encodedValue)
+          .replace(`{${camelCaseParamName}}`, () => encodedValue)
+          .replace(`:${camelCaseParamName}`, () => encodedValue);
         logger.info(`Path param fallback: replaced :${camelCaseParamName} with encoded value`);
+      } else if (paramName.toLowerCase() === 'accept' && config?.acceptType) {
+        // The synthetic Accept param added for acceptType endpoints. It has no entry in
+        // the generated client's parameter list, so it lands here rather than in the
+        // 'Header' case above. Same rule as the byte-download tools; an empty value
+        // means unset, so the configured default still applies.
+        if (paramValue !== '' && paramValue != null) {
+          if (typeof paramValue !== 'string' || !isAcceptValue(paramValue)) {
+            throw new Error(ACCEPT_VALUE_ERROR);
+          }
+          headers['Accept'] = paramValue;
+        }
       } else if (isOdataParam) {
         // Fallback: OData param recognised by name but absent from generated client's parameter
         // list — forward it as a query param rather than silently dropping it.
         queryParams[fixedParamName] = `${paramValue}`;
         logger.info(`OData param fallback: forwarded ${fixedParamName}=${paramValue}`);
+      } else if (
+        bodyShape &&
+        (hasOwn(bodyShape, paramName) || hasOwn(bodyShape, camelCaseParamName)) &&
+        !READ_ONLY_BODY_FIELDS.has(hasOwn(bodyShape, paramName) ? paramName : camelCaseParamName)
+      ) {
+        // Client flattened the body object into top-level params - rescue instead of
+        // dropping. The read-only check uses the resolved name so kebab-case variants
+        // can't sneak past
+        const fieldName = hasOwn(bodyShape, paramName) ? paramName : camelCaseParamName;
+        strayBodyFields[fieldName] = paramValue;
+        logger.info(
+          `Body field fallback: merging top-level param '${fieldName}' into request body`
+        );
+      } else {
+        logger.warn(`Dropping unrecognized parameter '${paramName}' for tool ${tool.alias}`);
       }
     }
 
-    // Defense-in-depth: the calendar delta tools don't support $top (see
-    // TOP_UNSUPPORTED_DELTA_TOOLS). Their user-facing schema strips top/$top, so
-    // freshly-connected clients can't send it. Cached/stale clients (and ad-hoc
-    // callers) might still try — drop it server-side before clamping or sending.
-    if (TOP_UNSUPPORTED_DELTA_TOOLS.has(tool.alias)) {
-      delete queryParams['$top'];
+    // encodeURIComponent leaves "." alone and skipEncoding values go in raw, so a path
+    // parameter can still be a dot segment or carry its own "?" or "#" (GHSA-42wc-j69p-jppq)
+    if (!isUnalteredGraphPath(path)) {
+      return invalidPathParameter(
+        'A path parameter would send this request to a different endpoint. Path parameters cannot be "." or "..", or contain "/../", "?", "#" or a backslash. Percent-encode "?" and "#" that are part of a name.'
+      );
+    }
+
+    // The client passed the nested itemBody's own fields as the whole request body - move
+    // them under the schema's `body` field (#620). Graph body schemas are all-optional, so
+    // the safeParse wrap in `case 'Body'` can't catch this: the inner itemBody parses clean
+    // as the outer type. A key only moves if it belongs to the nested field's own shape;
+    // being unknown to the outer shape means nothing, because generated schemas are trimmed
+    // subsets that passthrough real fields (message.isRead isn't in the shape). Keys are
+    // matched case-insensitively, and anything left behind stays top-level so a stray
+    // sibling can't cost us the repair - or get buried in the body and silently lost
+    if (
+      isPlainObject(body) &&
+      bodyShape != null &&
+      hasOwn(bodyShape, 'body') &&
+      !Object.keys(body).some((k) => k.toLowerCase() === 'body')
+    ) {
+      const nestedShape = bodySchemaShape(bodyShape.body as z.ZodTypeAny);
+      if (nestedShape != null) {
+        const nestedKeys = new Set(Object.keys(nestedShape).map((k) => k.toLowerCase()));
+        const outerKeys = new Set(Object.keys(bodyShape).map((k) => k.toLowerCase()));
+        // Null-prototype accumulators: a literal would route a '__proto__' key through the
+        // legacy setter, dropping the field instead of storing it
+        const nested: Record<string, unknown> = Object.create(null);
+        const kept: Record<string, unknown> = Object.create(null);
+        const annotations: Record<string, unknown> = Object.create(null);
+
+        for (const [key, value] of Object.entries(body)) {
+          const lower = key.toLowerCase();
+          if (key.startsWith('@')) {
+            // An annotation belongs to whatever it names, so only an @odata.type naming the
+            // nested type travels with the moved fields. An outer @odata.type (or an
+            // @odata.etag) describes the entity it is already on and stays put
+            if (lower === '@odata.type' && namesNestedBodyType(value)) {
+              annotations[key] = value;
+            } else {
+              kept[key] = value;
+            }
+          } else if (nestedKeys.has(lower) && !outerKeys.has(lower)) {
+            nested[key] = value;
+          } else {
+            kept[key] = value;
+          }
+        }
+
+        if (Object.keys(nested).length > 0) {
+          body = { ...kept, body: { ...nested, ...annotations } };
+          bodyRepaired = true;
+          logger.info(
+            `Moved misplaced fields into nested 'body' for ${tool.alias}: ${Object.keys(nested).join(', ')}`
+          );
+        }
+      }
+    }
+
+    if (Object.keys(strayBodyFields).length > 0) {
+      if (
+        httpMethod === 'PATCH' &&
+        !bodyRepaired &&
+        isPlainObject(body) &&
+        Object.keys(body).length > 0
+      ) {
+        // A PATCH changes exactly the properties it carries, so an explicit entity body is
+        // authoritative: merging flattened siblings would update properties the caller never
+        // put in it (#731). Field names only - the values can be message content
+        logger.warn(
+          `Ignoring flattened body fields (${Object.keys(strayBodyFields).join(', ')}) for ${tool.alias}: PATCH uses the explicit body as-is; put every property to change inside body`
+        );
+      } else if (isPlainObject(body)) {
+        // Spread order lets an explicit body win over stray duplicates
+        body = { ...strayBodyFields, ...body };
+        logger.info(`Merged flattened body fields: ${Object.keys(strayBodyFields).join(', ')}`);
+      } else if (body == null) {
+        body = strayBodyFields;
+        logger.info(`Merged flattened body fields: ${Object.keys(strayBodyFields).join(', ')}`);
+      } else {
+        logger.warn(
+          `Cannot merge flattened body fields (${Object.keys(strayBodyFields).join(', ')}) into non-object request body; dropping them`
+        );
+      }
+    }
+
+    if (config?.mentionShorthand) {
+      const rewritten = rewriteMentionShorthand(body);
+      if (rewritten.error) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ error: rewritten.error }) }],
+          isError: true,
+        };
+      }
+      body = rewritten.body;
+    }
+
+    const skiptokenError = normalizeSkiptokenQueryParam(
+      queryParams,
+      tool.alias,
+      config?.deltaToken
+    );
+    if (skiptokenError) return skiptokenError;
+    if (config?.deltaToken) {
+      const deltaTokenError = normalizeDeltaTokenParam(params.token, queryParams, tool.alias);
+      if (deltaTokenError) return deltaTokenError;
     }
 
     clampTopQueryParam(queryParams);
+    const searchError = normalizeSearchQueryParam(queryParams, tool.path, tool.alias);
+    if (searchError) return searchError;
 
     const preferValues: string[] = [];
 
@@ -925,10 +3498,56 @@ async function executeGraphTool(
       logger.info(`Setting custom Content-Type: ${config.contentType}`);
     }
 
-    if (config?.acceptType) {
+    if (config?.acceptType && !headers['Accept']) {
       headers['Accept'] = config.acceptType;
       logger.info(`Setting custom Accept: ${config.acceptType}`);
     }
+    // The fallback applies whenever the configured default is what goes out, even
+    // when the caller echoed it explicitly; a different explicit Accept is honoured as-is.
+    // A caller-set $format wins over Accept at Graph, so a retry would be refused again:
+    // no fallback then either.
+    const acceptFallback =
+      // Media types compare case-insensitively (RFC 9110 §8.3.1).
+      config?.acceptType &&
+      headers['Accept']?.toLowerCase() === config.acceptType.toLowerCase() &&
+      queryParams['$format'] === undefined
+        ? config.acceptFallback
+        : undefined;
+
+    // Captured before the query string is built so the same value can be reapplied to
+    // the response for the operations where Graph ignores it (#660). $select is what
+    // triggers projection; $expand only widens what survives it, since in OData an
+    // expanded navigation property comes back in addition to the selected fields
+    // (supportsExpandExtendedProperties adds one of its own just above).
+    const requestedSelect = parseSelectFields(queryParams['$select']);
+    // Keyed on the Graph path, not the tool name: every tool that reaches the users
+    // surface has to be covered, not just list-users.
+    const enforcement = userFields === undefined ? 'none' : userFieldEnforcement(path);
+    const isUserFieldBoundary = enforcement !== 'none';
+    const boundaryFields =
+      isUserFieldBoundary && userFields !== undefined
+        ? restrictUserFieldQuery(queryParams, userFields, enforcement)
+        : [];
+    if (userFields !== undefined && shouldStripUserFieldExpand(path)) {
+      delete queryParams['$expand'];
+    }
+    if (isUserFieldBoundary) {
+      logger.info(
+        `Restricting ${tool.alias} to configured user fields (${enforcement}): ${boundaryFields}`
+      );
+    }
+    // graph-batch carries its subrequests in the body, so the restriction has to be
+    // applied per subrequest URL and then to each matching subresponse.
+    let batchRestricted = new Map<string, string[]>();
+    if (userFields !== undefined) {
+      const restrictedBatch = restrictBatchSubrequests(body, userFields);
+      body = restrictedBatch.body;
+      batchRestricted = restrictedBatch.restricted;
+    }
+    const projectionSelect = isUserFieldBoundary ? boundaryFields : requestedSelect;
+    const keepFields = [
+      ...new Set([...projectionSelect, ...parseSelectFields(queryParams['$expand'])]),
+    ];
 
     if (Object.keys(queryParams).length > 0) {
       const queryString = Object.entries(queryParams)
@@ -947,10 +3566,29 @@ async function executeGraphTool(
       queryParams?: Record<string, string>;
       accessToken?: string;
       apiVersion?: string;
+      forceJsonOutput?: boolean;
+      forceBinary?: boolean;
+      maxBytes?: number;
+      blobOutput?: { fileName?: string };
+      acceptFallback?: AcceptFallback;
     } = {
       method: tool.method.toUpperCase(),
       headers,
+      ...(acceptFallback ? { acceptFallback } : {}),
     };
+
+    // A fixedBody tool has no body param of its own, so this is the whole body
+    if (config?.fixedBody) {
+      body = { ...config.fixedBody };
+    }
+
+    if (config?.blobOutput && isBlobOutputEnabled()) {
+      options.forceBinary = true;
+      options.maxBytes = getBlobMaxBytes();
+      options.blobOutput = {
+        fileName: typeof params.fileName === 'string' ? params.fileName : undefined,
+      };
+    }
 
     // Route beta-flagged endpoints to the /beta surface; everything else stays on v1.0.
     if (config?.apiVersion) {
@@ -1004,13 +3642,16 @@ async function executeGraphTool(
       options.accessToken = accountAccessToken;
     }
 
+    targetResource = deriveTargetResource({
+      pathPattern: config?.pathPattern ?? tool.path,
+      params,
+    });
+
     // Redact accessToken from log output to prevent credential leakage
     const { accessToken: _redacted, ...safeOptions } = options;
     logger.info(
       `Making graph request to ${path} with options: ${JSON.stringify(safeOptions)}${_redacted ? ' [accessToken=REDACTED]' : ''}`
     );
-
-    let response = await graphClient.graphRequest(path, options);
 
     const fetchAllPages = params.fetchAllPages === true;
     const paginationEnabled = paginationAllowed();
@@ -1019,75 +3660,235 @@ async function executeGraphTool(
         'fetchAllPages requested but MS365_MCP_ALLOW_PAGINATION is disabled; returning first page only'
       );
     }
-    if (fetchAllPages && paginationEnabled && response?.content?.[0]?.text) {
+    // Force every page to JSON so the merge loop can parse them. Under --toon they'd
+    // be TOON and JSON.parse would throw, silently returning only page one (#560).
+    // The merged result gets re-encoded once at the end.
+    const mergePages = fetchAllPages && paginationEnabled;
+    // Projecting means parsing the body, and under --toon JSON.parse would throw and
+    // leave the response untrimmed. Same reason the merge below forces JSON (#560).
+    const willProject =
+      (requestedSelect.length > 0 || isUserFieldBoundary) && params.excludeResponse !== true;
+    const willProjectBatch = batchRestricted.size > 0 && params.excludeResponse !== true;
+    const willFilterMembers =
+      memberNameFilter !== undefined &&
+      memberNameFilter.trim() !== '' &&
+      params.excludeResponse !== true;
+    if (mergePages || willProject || willProjectBatch || willFilterMembers) {
+      options.forceJsonOutput = true;
+    }
+
+    let response = await graphClient.graphRequest(path, options);
+
+    const shouldProject = willProject && !response?.isError;
+    let projectionHandled = false;
+    // Filter before serialize(), like projection: under --toon serialize() emits TOON and
+    // JSON.parse on it would throw, silently skipping the filter (#560).
+    let memberFilterHandled = false;
+    const applyMemberFilter = (body: unknown): unknown => {
+      if (!willFilterMembers) return body;
+      memberFilterHandled = true;
+      const filtered = filterMembersByName(body, memberNameFilter as string);
+      if (isPlainObject(filtered) && Array.isArray(filtered.value) && response._meta) {
+        response._meta = { ...response._meta, result_count: filtered.value.length };
+      }
+      return filtered;
+    };
+    const applyProjection = (body: unknown): unknown => {
+      // Binary, raw-text and ack payloads are wrapped in an envelope of this server's
+      // own making. Projecting one strips every key and hands back {}, losing the
+      // transcript or file outright.
+      if (isTransportEnvelope(body)) {
+        logger.info('Skipping $select projection: body is a transport envelope, not a resource');
+        return body;
+      }
+      // Graph never rejects a misspelled property on the endpoints that ignore $select,
+      // so without this a typo would silently empty the response instead of erroring.
+      // The user-field boundary is exempt: there, returning the body untrimmed would hand
+      // back every property Graph sent, which is the one outcome the allowlist forbids.
+      if (!isUserFieldBoundary && !anyFieldPresent(body, projectionSelect)) {
+        logger.warn(
+          `None of the requested $select fields (${projectionSelect.join(',')}) appear in the response; returning it untrimmed`
+        );
+        return body;
+      }
+      return projectSelectedFields(body, keepFields, isUserFieldBoundary);
+    };
+
+    if (mergePages && response?.content?.[0]?.text) {
+      type ODataPage = {
+        value?: unknown[];
+        '@odata.nextLink'?: string;
+        '@odata.deltaLink'?: string;
+        '@odata.count'?: number;
+        [key: string]: unknown;
+      };
+      let combinedResponse: ODataPage | undefined;
       try {
-        let combinedResponse = JSON.parse(response.content[0].text);
-        let allItems = combinedResponse.value || [];
-        let nextLink = combinedResponse['@odata.nextLink'];
-        let pageCount = 1;
-        const maxPages = positiveIntFromEnv('MS365_MCP_MAX_PAGES', DEFAULT_MAX_PAGES);
-        const maxItems = positiveIntFromEnv('MS365_MCP_MAX_ITEMS', DEFAULT_MAX_ITEMS);
-        // Graph only emits @odata.deltaLink on the final page of a /delta query.
-        // Track it across the pagination loop so we can stamp it on the combined
-        // response — otherwise fetchAllPages on a /delta endpoint silently drops
-        // the resume token and forces callers to re-list from scratch.
-        let deltaLink: string | undefined = combinedResponse['@odata.deltaLink'];
+        combinedResponse = JSON.parse(response.content[0].text) as ODataPage;
 
-        while (nextLink && pageCount < maxPages && allItems.length < maxItems) {
-          logger.info(`Fetching page ${pageCount + 1} from: ${nextLink}`);
+        // Only merge if page one is actually a collection. fetchAllPages can be set
+        // on a single-object GET too, and we'd otherwise graft a bogus value:[] on it.
+        const firstValue = combinedResponse.value;
+        if (Array.isArray(firstValue)) {
+          let allItems: unknown[] = firstValue;
+          let nextLink = combinedResponse['@odata.nextLink'];
+          let pageCount = 1;
+          // Page one's bytes, to be added to as pages arrive. Undefined stays
+          // undefined rather than becoming 0: an unknown total must not read as
+          // an empty one.
+          let totalResponseBytes = response._meta?.response_bytes;
+          const maxPages = positiveIntFromEnv('MS365_MCP_MAX_PAGES', DEFAULT_MAX_PAGES);
+          const maxItems = positiveIntFromEnv('MS365_MCP_MAX_ITEMS', DEFAULT_MAX_ITEMS);
+          // Graph only emits @odata.deltaLink on the final page of a /delta query.
+          // Track it across the pagination loop so we can stamp it on the combined
+          // response — otherwise fetchAllPages on a /delta endpoint silently drops
+          // the resume token and forces callers to re-list from scratch.
+          let deltaLink = combinedResponse['@odata.deltaLink'];
 
-          // Extract path + query string from the nextLink URL.
-          // Pass the full path (with query string) as the endpoint so that
-          // $skiptoken and other pagination params are preserved.
-          // Previously, query params were extracted into nextOptions.queryParams
-          // but graphRequest/performRequest never read that field — they were lost.
-          const url = new URL(nextLink);
-          // nextLink is absolute and version-qualified (/v1.0/... or /beta/...). Strip the
-          // version segment so performRequest can re-apply the request's own apiVersion.
-          const nextPath = url.pathname.replace(/^\/(v1\.0|beta)/, '') + url.search;
-          const nextOptions = { ...options };
+          while (nextLink && pageCount < maxPages && allItems.length < maxItems) {
+            logger.info(`Fetching page ${pageCount + 1} from: ${nextLink}`);
 
-          const nextResponse = await graphClient.graphRequest(nextPath, nextOptions);
-          if (nextResponse?.content?.[0]?.text) {
-            const nextJsonResponse = JSON.parse(nextResponse.content[0].text);
-            if (nextJsonResponse.value && Array.isArray(nextJsonResponse.value)) {
+            // Extract path + query string from the nextLink URL.
+            // Pass the full path (with query string) as the endpoint so that
+            // $skiptoken and other pagination params are preserved.
+            // Previously, query params were extracted into nextOptions.queryParams
+            // but graphRequest/performRequest never read that field — they were lost.
+            const url = new URL(nextLink);
+            // nextLink is absolute and version-qualified (/v1.0/... or /beta/...). Strip the
+            // version segment so performRequest can re-apply the request's own apiVersion.
+            const nextPath = url.pathname.replace(/^\/(v1\.0|beta)/, '') + url.search;
+            const nextOptions = { ...options };
+
+            const nextResponse = await graphClient.graphRequest(nextPath, nextOptions);
+            if (nextResponse?.isError) {
+              response = nextResponse;
+              combinedResponse = undefined;
+              break;
+            }
+            if (nextResponse?.content?.[0]?.text) {
+              const nextJsonResponse = JSON.parse(nextResponse.content[0].text) as ODataPage;
+              // A page that is not a collection cannot be merged. Falling through would
+              // clear nextLink and stamp the short list as complete, so stop here and
+              // leave nextLink set: result_has_more then reports the read as incomplete,
+              // and this page's bytes stay out of the total.
+              if (!Array.isArray(nextJsonResponse.value)) {
+                logger.warn(
+                  `Pagination stopped at page ${pageCount + 1}: response was not a collection`
+                );
+                break;
+              }
               allItems = allItems.concat(nextJsonResponse.value);
+              nextLink = nextJsonResponse['@odata.nextLink'];
+              if (
+                typeof totalResponseBytes === 'number' &&
+                typeof nextResponse._meta?.response_bytes === 'number'
+              ) {
+                totalResponseBytes += nextResponse._meta.response_bytes;
+              }
+              if (nextJsonResponse['@odata.deltaLink']) {
+                deltaLink = nextJsonResponse['@odata.deltaLink'];
+              }
+              pageCount++;
+            } else {
+              break;
             }
-            nextLink = nextJsonResponse['@odata.nextLink'];
-            if (nextJsonResponse['@odata.deltaLink']) {
-              deltaLink = nextJsonResponse['@odata.deltaLink'];
+          }
+
+          if (combinedResponse !== undefined) {
+            if (pageCount >= maxPages) {
+              logger.warn(`Reached maximum page limit (${maxPages}) for pagination`);
             }
-            pageCount++;
-          } else {
-            break;
+            if (allItems.length >= maxItems) {
+              logger.warn(
+                `Reached maximum item limit (${maxItems}) for pagination — truncated at ${allItems.length} items`
+              );
+            }
+
+            combinedResponse.value = allItems;
+            // @odata.count is Graph's total for the filtered collection, so it is
+            // left as page one reported it (it can exceed allItems.length when
+            // maxPages/maxItems truncates the merge).
+            // Keep the outstanding cursor whenever the merge stops early, including
+            // configured limits, so callers can continue without replaying page one.
+            if (nextLink) {
+              combinedResponse['@odata.nextLink'] = nextLink;
+            } else {
+              delete combinedResponse['@odata.nextLink'];
+            }
+            // The client's metadata described page one. Now that pages are
+            // merged, restate all three for the whole read.
+            //
+            // nextLink still being set means the loop stopped early: on maxPages,
+            // on maxItems, or on a page it could not merge. Graph has more.
+            response._meta = {
+              ...response._meta,
+              result_count: allItems.length,
+              result_has_more: Boolean(nextLink),
+              ...(totalResponseBytes !== undefined ? { response_bytes: totalResponseBytes } : {}),
+            };
+            if (deltaLink) {
+              combinedResponse['@odata.deltaLink'] = deltaLink;
+            }
+
+            logger.info(
+              `Pagination ${nextLink ? 'incomplete' : 'complete'}: collected ${allItems.length} items across ${pageCount} pages`
+            );
           }
         }
-
-        if (pageCount >= maxPages) {
-          logger.warn(`Reached maximum page limit (${maxPages}) for pagination`);
-        }
-        if (allItems.length >= maxItems) {
-          logger.warn(
-            `Reached maximum item limit (${maxItems}) for pagination — truncated at ${allItems.length} items`
-          );
-        }
-
-        combinedResponse.value = allItems;
-        if (combinedResponse['@odata.count']) {
-          combinedResponse['@odata.count'] = allItems.length;
-        }
-        delete combinedResponse['@odata.nextLink'];
-        if (deltaLink) {
-          combinedResponse['@odata.deltaLink'] = deltaLink;
-        }
-
-        response.content[0].text = JSON.stringify(combinedResponse);
-
-        logger.info(
-          `Pagination complete: collected ${allItems.length} items across ${pageCount} pages`
-        );
       } catch (e) {
         logger.error(`Error during pagination: ${e}`);
+      }
+
+      // Re-encode once in the configured format. Runs whenever page one parsed
+      // (non-collection skip and mid-loop abort included), so a --toon client
+      // never gets handed the forced-JSON body.
+      if (combinedResponse !== undefined) {
+        // Project before serialize(), not after: under --toon serialize() emits TOON and
+        // parsing that back as JSON would throw, silently skipping the projection.
+        const merged = applyMemberFilter(
+          shouldProject ? applyProjection(combinedResponse) : combinedResponse
+        );
+        projectionHandled = shouldProject;
+        response.content[0].text = graphClient.serialize(merged);
+      }
+    }
+
+    // isError is re-tested: a failing page inside the merge loop replaces `response`
+    // with the error result, which shouldProject (computed before the request) misses.
+    if (shouldProject && !projectionHandled && !response?.isError && response?.content?.[0]?.text) {
+      try {
+        const parsed = JSON.parse(response.content[0].text);
+        response.content[0].text = graphClient.serialize(
+          applyMemberFilter(applyProjection(parsed))
+        );
+      } catch {
+        // Body was not JSON after all; nothing to project.
+      }
+    }
+
+    if (willProjectBatch && !response?.isError && response?.content?.[0]?.text) {
+      try {
+        const parsed = JSON.parse(response.content[0].text);
+        response.content[0].text = graphClient.serialize(
+          projectBatchSubresponses(parsed, batchRestricted)
+        );
+      } catch {
+        // Body was not JSON after all; nothing to project.
+      }
+    }
+
+    if (
+      willFilterMembers &&
+      !memberFilterHandled &&
+      !response?.isError &&
+      response?.content?.[0]?.text
+    ) {
+      try {
+        response.content[0].text = graphClient.serialize(
+          applyMemberFilter(JSON.parse(response.content[0].text))
+        );
+      } catch {
+        // Body was not JSON after all; nothing to filter.
       }
     }
 
@@ -1109,10 +3910,11 @@ async function executeGraphTool(
     }
 
     // Convert McpResponse to CallToolResult with the correct structure
-    const content: ContentItem[] = response.content.map((item) => ({
-      type: 'text' as const,
-      text: item.text,
-    }));
+    const content: ContentItem[] = response.content.map((item) =>
+      (item as { type: string }).type === 'resource'
+        ? (item as unknown as ResourceContent)
+        : { type: 'text' as const, text: item.text }
+    );
 
     auditLog({
       event: 'tool.call',
@@ -1122,6 +3924,9 @@ async function executeGraphTool(
       http_method: httpMethod,
       status: response.isError ? 'error' : 'success',
       duration_ms: Date.now() - startTime,
+      ...(targetResource ? { target_resource: targetResource } : {}),
+      ...graphResponseAuditFields(response),
+      ...recipientAuditFields(body),
     });
 
     return {
@@ -1140,8 +3945,10 @@ async function executeGraphTool(
       http_method: httpMethod,
       status: 'error',
       duration_ms: Date.now() - startTime,
+      ...(targetResource ? { target_resource: targetResource } : {}),
       error_type: err?.name || 'Error',
-      error_code: err?.status ?? err?.code,
+      ...thrownErrorAuditFields(error),
+      ...recipientAuditFields(body),
     });
     return {
       content: [
@@ -1157,17 +3964,236 @@ async function executeGraphTool(
   }
 }
 
+/**
+ * Configuration for the two registration entry points. Named rather than positional: the
+ * tail is a run of optional primitives, so a missed argument used to type-check while
+ * silently shifting `allowedScopes` or `userFields` into the wrong slot.
+ */
+export interface GraphToolRegistrationOptions {
+  eagerTools?: string[];
+  /** Receives unavailable eager selections; hosts can deduplicate diagnostics across requests. */
+  onUnavailableEagerTool?: (name: string) => void;
+  readOnly?: boolean;
+  enabledTools?: string;
+  orgMode?: boolean;
+  appMode?: boolean;
+  authManager?: AuthManager;
+  multiAccount?: boolean;
+  accountNames?: string[];
+  allowedScopes?: string;
+  httpMode?: boolean;
+  userFields?: string;
+}
+
+/** What registerGraphTools passes to fit each tool into the connector definition budget. */
+interface ToolBudgetContext {
+  /** undefined = measure and report only; pruning is opt-in via the env var. */
+  definitionBudget: number | undefined;
+  /** Every setting besides static endpoint data that shapes a tool's paramSchema. */
+  schemaFingerprint: string;
+}
+
+/**
+ * Registers one Graph tool. With a budget context, the tool's served schema is measured
+ * (and, when a ration is set, its body depth trimmed) and the fit is returned; without
+ * one, as for eager tools in discovery mode, the schema registers as generated.
+ */
+function registerGraphToolWithMcp(
+  server: McpServer,
+  tool: (typeof allEndpoints)[number],
+  endpointConfig: EndpointConfig | undefined,
+  graphClient: GraphClient,
+  options: GraphToolRegistrationOptions,
+  budget?: ToolBudgetContext
+): BudgetFitResult | undefined {
+  const { authManager, multiAccount = false, accountNames = [] } = options;
+  const userFields = parseUserFields(options.userFields);
+  const paramSchema: Record<string, z.ZodTypeAny> = {};
+  const bodyParamNames: string[] = [];
+  if (tool.parameters && tool.parameters.length > 0) {
+    for (const param of tool.parameters) {
+      if (param.type === 'Query') {
+        const schema = queryParameterSchema(param.name, param.schema || z.any(), endpointConfig);
+        if (schema) paramSchema[param.name] = schema;
+        continue;
+      }
+      // Lenient Body validation, or the SDK strips a flattened body value to {} (#569)
+      if (param.type === 'Body' && param.schema) {
+        paramSchema[param.name] = lenientBodySchema(param.schema as z.ZodTypeAny);
+        bodyParamNames.push(param.name);
+      } else {
+        paramSchema[param.name] = param.schema || z.any();
+      }
+    }
+  }
+
+  // Extract path parameters from the path pattern (e.g., :todoTaskListId from /me/todo/lists/:todoTaskListId/tasks)
+  // The generated client omits these from tool.parameters, so we add them manually.
+  const pathParamMatches = tool.path.matchAll(/:([a-zA-Z]+)/g);
+  for (const match of pathParamMatches) {
+    const pathParamName = match[1];
+    if (!(pathParamName in paramSchema)) {
+      paramSchema[pathParamName] = z.string().describe(describePathParam(pathParamName));
+    }
+  }
+
+  // Endpoints with a configured acceptType get a synthetic, optional `Accept` param.
+  // The generated client declares no Accept header anywhere, so without this the
+  // caller has no way to reach the alternate representation of the resource — the
+  // configured default would be the only value the server can ever send.
+  if (endpointConfig?.acceptType && paramSchema['Accept'] === undefined) {
+    paramSchema['Accept'] = acceptValueSchema().describe(
+      getAcceptParamDescription(endpointConfig.acceptType)
+    );
+  }
+
+  if (endpointConfig?.blobOutput && paramSchema['fileName'] === undefined) {
+    paramSchema['fileName'] = z
+      .string()
+      .optional()
+      .describe(
+        'Name of the file, used as the last segment of the returned resource URI when the server runs with blob output. Optional.'
+      );
+  }
+
+  if (isFetchAllPagesApplicable(tool)) {
+    const maxPages = getMaxPages();
+    paramSchema['fetchAllPages'] = z
+      .boolean()
+      .optional()
+      .describe(getFetchAllPagesParamDescription(maxPages, endpointConfig));
+  }
+
+  if (endpointConfig?.nameFilter) {
+    paramSchema['name'] = z.string().optional().describe(MEMBER_NAME_PARAM_DESCRIPTION);
+  }
+
+  if (isSkiptokenApplicable(tool, Object.keys(paramSchema), endpointConfig)) {
+    paramSchema['skiptoken'] = z.string().optional().describe(SKIPTOKEN_PARAM_DESCRIPTION);
+  }
+
+  // Replaces any generated `token` too, whose description does not say what to pass
+  if (endpointConfig?.deltaToken) {
+    paramSchema['token'] = z.string().optional().describe(DELTA_TOKEN_PARAM_DESCRIPTION);
+  }
+
+  // Add account parameter for multi-account mode.
+  // Layer 2: Account names are surfaced in the description (not as a strict enum) so the LLM
+  // sees available accounts upfront without a round-trip, but accounts added mid-session via
+  // --login are still accepted — getTokenForAccount() handles validation at runtime.
+  if (multiAccount) {
+    paramSchema['account'] = z
+      .string()
+      .optional()
+      .describe(getAccountParamDescription(accountNames));
+  }
+
+  // Add includeHeaders parameter for all tools to capture ETags and other headers
+  paramSchema['includeHeaders'] = z
+    .boolean()
+    .optional()
+    .describe('Include response headers (including ETag) in the response metadata');
+
+  // Add excludeResponse parameter to only return success/failure indication
+  paramSchema['excludeResponse'] = z
+    .boolean()
+    .optional()
+    .describe('Exclude the full response body and only return success or failure indication');
+
+  // Destructive tools (POST except readOnly, PATCH, PUT, DELETE) require an
+  // explicit `confirm: true` server-side gate. See isDestructiveOperation +
+  // executeGraphTool for the enforcement; surface the param in the schema so
+  // the LLM/agent sees it upfront.
+  const destructive = isDestructiveOperation(tool.method, endpointConfig);
+  if (destructive) {
+    paramSchema['confirm'] = z.boolean().optional().describe(CONFIRM_PARAM_DESCRIPTION);
+  }
+
+  // Add timezone parameter for calendar endpoints that support it
+  if (endpointConfig?.supportsTimezone) {
+    paramSchema['timezone'] = z.string().optional().describe(TIMEZONE_PARAM_DESCRIPTION);
+  }
+
+  // Add expandExtendedProperties parameter for calendar endpoints that support it
+  if (endpointConfig?.supportsExpandExtendedProperties) {
+    paramSchema['expandExtendedProperties'] = z
+      .boolean()
+      .optional()
+      .describe(EXPAND_EXTENDED_PROPERTIES_PARAM_DESCRIPTION);
+  }
+
+  // Build the tool description, optionally appending LLM tips
+  let toolDescription = withApiVersionPrefix(
+    (endpointConfig?.descriptionOverride ?? tool.description) ||
+      `Execute ${tool.method.toUpperCase()} request to ${tool.path}`,
+    endpointConfig
+  );
+  if (endpointConfig?.llmTip) {
+    toolDescription += `\n\n💡 TIP: ${endpointConfig.llmTip}`;
+  }
+
+  // An endpoint marked readOnly in endpoints.json (e.g. a POST query like
+  // copilot-retrieve) is a read-only operation despite its write verb, so derive
+  // the hints from that flag rather than the HTTP method alone — otherwise a
+  // read-only query lands as destructiveHint:true and clients mis-rank it.
+  const isReadOnlyTool = tool.method.toUpperCase() === 'GET' || endpointConfig?.readOnly === true;
+
+  // A connector is served a bounded total of input-schema bytes, charged in
+  // alphabetical order, and a tool that no longer fits is skipped whole - so an
+  // oversized write schema costs us unrelated tools later in the alphabet. Measure what
+  // each tool costs; when a ration is set, trim the body depth of the few tools that
+  // overflow it and register the rest byte-for-byte unchanged. Memoised per tool: HTTP
+  // mode re-registers everything on every request, and the measuring pass is the
+  // expensive part of registration.
+  const fit = budget
+    ? fitToolDefinitionToBudget(
+        paramSchema,
+        bodyParamNames,
+        budget.definitionBudget ?? Number.POSITIVE_INFINITY,
+        `${budget.schemaFingerprint}|${tool.alias}`
+      )
+    : undefined;
+
+  // .loose() object, not a raw shape - the SDK wraps raw shapes in z.object()
+  // and strips unknown keys before the handler runs, which is exactly how #569's
+  // flattened subject/toRecipients got lost
+  server.registerTool(
+    tool.alias,
+    {
+      title: tool.alias,
+      description: toolDescription,
+      inputSchema: z.object(fit?.paramSchema ?? paramSchema).loose(),
+      annotations: {
+        title: tool.alias,
+        readOnlyHint: isReadOnlyTool,
+        destructiveHint: destructive,
+        openWorldHint: true, // All tools call Microsoft Graph API
+      },
+    },
+    async (params: Record<string, unknown>) =>
+      executeGraphTool(tool, endpointConfig, graphClient, params, authManager, userFields)
+  );
+  return fit;
+}
+
 export function registerGraphTools(
   server: McpServer,
   graphClient: GraphClient,
-  readOnly: boolean = false,
-  enabledToolsPattern?: string,
-  orgMode: boolean = false,
-  authManager?: AuthManager,
-  multiAccount: boolean = false,
-  accountNames: string[] = [],
-  allowedScopesValue?: string
+  options: GraphToolRegistrationOptions = {}
 ): number {
+  const {
+    readOnly = false,
+    enabledTools: enabledToolsPattern,
+    orgMode = false,
+    appMode = false,
+    authManager,
+    multiAccount = false,
+    accountNames = [],
+    allowedScopes: allowedScopesValue,
+    httpMode = false,
+    userFields: userFieldsValue,
+  } = options;
+  const userFields = parseUserFields(userFieldsValue);
   let enabledToolsRegex: RegExp | undefined;
   if (enabledToolsPattern) {
     try {
@@ -1183,11 +4209,35 @@ export function registerGraphTools(
   let failedCount = 0;
   const allowedScopes = parseAllowedScopes(allowedScopesValue);
   const disabledByAllowedScopes: DisabledToolScope[] = [];
+  const scopeMode = scopeModeFor({ orgMode, appMode });
+  const deniedTools = collectDeniedToolPolicies({
+    readOnly,
+    scopeMode,
+    enabledToolsRegex,
+    allowedScopesValue,
+    httpMode,
+  });
+  // What the connector budget is charged for the Graph tools, summed as they register.
+  let servedSchemaBytes = 0;
+  const definitionBudget = getToolDefinitionBudget();
+  // Keys the fit cache, so a process that flips one of these (tests do) never reuses a
+  // stale fit. Mirror every env read the schema build makes: budget, account list,
+  // fetchAllPages presence (MS365_MCP_ALLOW_PAGINATION) and its page cap.
+  const budgetContext: ToolBudgetContext = {
+    definitionBudget,
+    schemaFingerprint: [
+      definitionBudget ?? 'unrationed',
+      multiAccount ? accountNames.join('\0') : '',
+      paginationAllowed(),
+      getMaxPages(),
+    ].join('|'),
+  };
+  const prunedForBudget: PrunedForBudget[] = [];
 
   for (const tool of allEndpoints) {
     const endpointConfig = endpointsData.find((e) => e.toolName === tool.alias);
-    if (!orgMode && endpointConfig && !endpointConfig.scopes && endpointConfig.workScopes) {
-      logger.info(`Skipping work account tool ${tool.alias} - not in org mode`);
+    if (!isEndpointInScopeMode(endpointConfig, scopeMode)) {
+      logger.info(`Skipping tool ${tool.alias} - not available in ${scopeMode} mode`);
       skippedCount++;
       continue;
     }
@@ -1214,7 +4264,7 @@ export function registerGraphTools(
       allowedScopes !== undefined && !endpointConfig
         ? ['endpoint scope metadata']
         : getMissingAllowedScopesForGroups(
-            getEndpointScopeGroups(endpointConfig, orgMode),
+            getEndpointScopeGroups(endpointConfig, scopeMode),
             allowedScopes
           );
     if (missingScopes.length > 0) {
@@ -1223,181 +4273,30 @@ export function registerGraphTools(
       continue;
     }
 
-    const paramSchema: Record<string, z.ZodTypeAny> = {};
-    if (tool.parameters && tool.parameters.length > 0) {
-      for (const param of tool.parameters) {
-        paramSchema[param.name] = param.schema || z.any();
-      }
-    }
-
-    // Extract path parameters from the path pattern (e.g., :todoTaskListId from /me/todo/lists/:todoTaskListId/tasks)
-    // The generated client omits these from tool.parameters, so we add them manually.
-    const pathParamMatches = tool.path.matchAll(/:([a-zA-Z]+)/g);
-    for (const match of pathParamMatches) {
-      const pathParamName = match[1];
-      if (!(pathParamName in paramSchema)) {
-        paramSchema[pathParamName] = z.string().describe(`Path parameter: ${pathParamName}`);
-      }
-    }
-
-    if (tool.method.toUpperCase() === 'GET' && tool.path.includes('/') && paginationAllowed()) {
-      const maxPages = positiveIntFromEnv('MS365_MCP_MAX_PAGES', DEFAULT_MAX_PAGES);
-      paramSchema['fetchAllPages'] = z
-        .boolean()
-        .describe(
-          `Follow @odata.nextLink and merge up to ${maxPages} pages into one response. ` +
-            'Can return enormous payloads—only when the user explicitly needs a full export. ' +
-            'Prefer a small $top first, then paginate or narrow with $filter/$search.'
-        )
-        .optional();
-    }
-
-    // Override OData parameter descriptions with spec-gap guidance
-    if (paramSchema['filter'] !== undefined || paramSchema['$filter'] !== undefined) {
-      const key = paramSchema['$filter'] !== undefined ? '$filter' : 'filter';
-      paramSchema[key] = z
-        .string()
-        .describe(
-          'OData filter expression. Add $count=true for advanced filters (flag/flagStatus, contains()). Cannot combine with $search.'
-        )
-        .optional();
-    }
-    if (paramSchema['search'] !== undefined || paramSchema['$search'] !== undefined) {
-      const key = paramSchema['$search'] !== undefined ? '$search' : 'search';
-      paramSchema[key] = z
-        .string()
-        .describe('KQL search query — wrap value in double quotes. Cannot combine with $filter.')
-        .optional();
-    }
-    if (paramSchema['select'] !== undefined || paramSchema['$select'] !== undefined) {
-      const key = paramSchema['$select'] !== undefined ? '$select' : 'select';
-      paramSchema[key] = z
-        .string()
-        .describe('Comma-separated fields to return, e.g. id,subject,from,receivedDateTime')
-        .optional();
-    }
-    if (paramSchema['orderby'] !== undefined || paramSchema['$orderby'] !== undefined) {
-      const key = paramSchema['$orderby'] !== undefined ? '$orderby' : 'orderby';
-      paramSchema[key] = z
-        .string()
-        .describe('Sort expression, e.g. receivedDateTime desc')
-        .optional();
-    }
-    // The calendar delta tools don't support $top (see TOP_UNSUPPORTED_DELTA_TOOLS) —
-    // page size is controlled via Prefer: odata.maxpagesize. Strip top/$top from
-    // their schemas so callers can't reach for a parameter that won't work. Other
-    // delta tools (message/driveItem/site) do support $top, so leave them alone.
-    // Server-side defense-in-depth in executeGraphTool handles stale clients.
-    if (TOP_UNSUPPORTED_DELTA_TOOLS.has(tool.alias)) {
-      delete paramSchema['top'];
-      delete paramSchema['$top'];
-    } else if (paramSchema['top'] !== undefined || paramSchema['$top'] !== undefined) {
-      const key = paramSchema['$top'] !== undefined ? '$top' : 'top';
-      paramSchema[key] = z
-        .number()
-        .describe(
-          'Page size (Graph $top). Start small (e.g. 5–15) so responses fit the model context; ' +
-            'raise only if needed. Use $select to return fewer fields per item. ' +
-            'For more rows, use @odata.nextLink from the response instead of a very large $top.'
-        )
-        .optional();
-    }
-    if (paramSchema['skip'] !== undefined || paramSchema['$skip'] !== undefined) {
-      const key = paramSchema['$skip'] !== undefined ? '$skip' : 'skip';
-      paramSchema[key] = z
-        .number()
-        .describe('Items to skip for pagination. Not supported with $search.')
-        .optional();
-    }
-    if (paramSchema['count'] !== undefined || paramSchema['$count'] !== undefined) {
-      const countKey = paramSchema['$count'] !== undefined ? '$count' : 'count';
-      paramSchema[countKey] = z
-        .boolean()
-        .describe(
-          'Set true to enable advanced query mode (ConsistencyLevel: eventual). Required for complex $filter on flag/flagStatus or contains().'
-        )
-        .optional();
-    }
-
-    // Add account parameter for multi-account mode.
-    // Layer 2: Account names are surfaced in the description (not as a strict enum) so the LLM
-    // sees available accounts upfront without a round-trip, but accounts added mid-session via
-    // --login are still accepted — getTokenForAccount() handles validation at runtime.
-    if (multiAccount) {
-      const accountHint =
-        accountNames.length > 0 ? `Known accounts: ${accountNames.join(', ')}. ` : '';
-      paramSchema['account'] = z
-        .string()
-        .describe(
-          `${accountHint}Microsoft account email to use for this request. ` +
-            `Required when multiple accounts are configured. ` +
-            `Use the list-accounts tool to discover all currently available accounts.`
-        )
-        .optional();
-    }
-
-    // Add includeHeaders parameter for all tools to capture ETags and other headers
-    paramSchema['includeHeaders'] = z
-      .boolean()
-      .describe('Include response headers (including ETag) in the response metadata')
-      .optional();
-
-    // Add excludeResponse parameter to only return success/failure indication
-    paramSchema['excludeResponse'] = z
-      .boolean()
-      .describe('Exclude the full response body and only return success or failure indication')
-      .optional();
-
-    // Add timezone parameter for calendar endpoints that support it
-    if (endpointConfig?.supportsTimezone) {
-      paramSchema['timezone'] = z
-        .string()
-        .describe(
-          'IANA timezone name (e.g., "America/New_York", "Europe/London", "Asia/Tokyo") for calendar event times. If not specified, times are returned in UTC.'
-        )
-        .optional();
-    }
-
-    // Add expandExtendedProperties parameter for calendar endpoints that support it
-    if (endpointConfig?.supportsExpandExtendedProperties) {
-      paramSchema['expandExtendedProperties'] = z
-        .boolean()
-        .describe(
-          'When true, expands singleValueExtendedProperties on each event. Use this to retrieve custom extended properties (e.g., sync metadata) stored on calendar events.'
-        )
-        .optional();
-    }
-
-    // Build the tool description, optionally appending LLM tips
-    let toolDescription = withApiVersionPrefix(
-      (endpointConfig?.descriptionOverride ?? tool.description) ||
-        `Execute ${tool.method.toUpperCase()} request to ${tool.path}`,
-      endpointConfig
-    );
-    if (endpointConfig?.llmTip) {
-      toolDescription += `\n\n💡 TIP: ${endpointConfig.llmTip}`;
-    }
-
-    // An endpoint marked readOnly in endpoints.json (e.g. a POST query like
-    // copilot-retrieve) is a read-only operation despite its write verb, so derive
-    // the hints from that flag rather than the HTTP method alone — otherwise a
-    // read-only query lands as destructiveHint:true and clients mis-rank it.
-    const isReadOnlyTool = tool.method.toUpperCase() === 'GET' || endpointConfig?.readOnly === true;
-
     try {
-      server.tool(
-        tool.alias,
-        toolDescription,
-        paramSchema,
-        {
-          title: tool.alias,
-          readOnlyHint: isReadOnlyTool,
-          destructiveHint:
-            !isReadOnlyTool && ['POST', 'PATCH', 'DELETE'].includes(tool.method.toUpperCase()),
-          openWorldHint: true, // All tools call Microsoft Graph API
-        },
-        async (params) => executeGraphTool(tool, endpointConfig, graphClient, params, authManager)
+      // Fitting runs inside registration, so a tool whose schema cannot be measured or
+      // trimmed fails alone instead of aborting the whole surface.
+      const fit = registerGraphToolWithMcp(
+        server,
+        tool,
+        endpointConfig,
+        graphClient,
+        options,
+        budgetContext
       );
+      if (fit) {
+        servedSchemaBytes += fit.bytesAfter;
+        if (fit.appliedStrategy !== null) {
+          prunedForBudget.push({
+            toolName: tool.alias,
+            depth: fit.appliedStrategy.maxDepth,
+            describeDepth: fit.appliedStrategy.describeDepth,
+            bytesBefore: fit.bytesBefore,
+            bytesAfter: fit.bytesAfter,
+            bodyWentOpaque: fit.bodyWentOpaque,
+          });
+        }
+      }
       registeredCount++;
     } catch (error) {
       logger.error(`Failed to register tool ${tool.alias}: ${(error as Error).message}`);
@@ -1420,11 +4319,16 @@ export function registerGraphTools(
     authManager,
     multiAccount,
     accountNames,
+    userFields,
   };
   for (const utility of UTILITY_TOOLS) {
-    if (readOnly && !utility.readOnlyHint) continue;
+    if (!isUtilityToolAvailable(utility, { readOnly, httpMode, scopeMode })) continue;
     if (enabledToolsRegex && !enabledToolsRegex.test(utility.name)) continue;
     try {
+      // Utility schemas are small and never pruned, but the connector charges for them
+      // like any other tool, so they belong in the total. server.tool() wraps the raw
+      // shape in a strict z.object(), so measure that form rather than a loose one.
+      servedSchemaBytes += measureInputSchemaBytes(z.object(utility.buildSchema(utilityCtx)));
       registerUtilityToolWithMcp(server, utility, utilityCtx);
       registeredCount++;
     } catch (error) {
@@ -1433,18 +4337,108 @@ export function registerGraphTools(
     }
   }
 
+  // The per-tool ration is a means; this total is the constraint that actually decides
+  // whether a tool is served by a hosted connector, so report it whether or not pruning
+  // is enabled — but once per surface, not once per request: HTTP mode registers on
+  // every POST.
+  const surfaceKey = [
+    budgetContext.schemaFingerprint,
+    readOnly,
+    scopeMode,
+    enabledToolsPattern ?? '',
+    allowedScopesValue ?? '',
+    httpMode,
+  ].join('|');
+  if (!budgetSummaryLogged.has(surfaceKey)) {
+    budgetSummaryLogged.add(surfaceKey);
+    logBudgetSummary(servedSchemaBytes, prunedForBudget, definitionBudget, httpMode);
+  }
+
   // Layer 3 (list-accounts tool) is registered by registerAuthTools in auth-tools.ts.
   // It is the canonical owner of account discovery — no duplicate registration here.
 
   logger.info(
     `Tool registration complete: ${registeredCount} registered, ${skippedCount} skipped, ${failedCount} failed`
   );
+  installDeniedToolAuditHandler(server, deniedTools);
   return registeredCount;
+}
+
+/** Surfaces whose budget summary has already been logged in this process. */
+const budgetSummaryLogged = new Set<string>();
+
+type PrunedForBudget = {
+  toolName: string;
+  depth: number;
+  describeDepth: number;
+  bytesBefore: number;
+  bytesAfter: number;
+  bodyWentOpaque: boolean;
+};
+
+function logBudgetSummary(
+  servedSchemaBytes: number,
+  prunedForBudget: readonly PrunedForBudget[],
+  budget: number | undefined,
+  httpMode: boolean
+): void {
+  const connectorShare = ((servedSchemaBytes / CONNECTOR_DEFINITION_BUDGET) * 100).toFixed(1);
+  logger.info(
+    `Tool input schemas total ${servedSchemaBytes} bytes as served by tools/list, ${connectorShare}% of the ${CONNECTOR_DEFINITION_BUDGET}-byte budget of a hosted connector`
+  );
+  // Only a hosted connector admits tools against that budget. Over stdio every tool is
+  // served whatever the total, so warning there would report drops that never happen.
+  if (httpMode && servedSchemaBytes > CONNECTOR_DEFINITION_BUDGET) {
+    const remedy =
+      budget === undefined
+        ? `Set MS365_MCP_TOOL_DEFINITION_BUDGET=${DEFAULT_TOOL_DEFINITION_BUDGET} to trim oversized request bodies, use --discovery, narrow --enabled-tools, or split the surface across two connectors.`
+        : `Lower MS365_MCP_TOOL_DEFINITION_BUDGET, use --discovery, narrow --enabled-tools, or split the surface across two connectors.`;
+    logger.warn(
+      `Served tool schemas exceed the ${CONNECTOR_DEFINITION_BUDGET}-byte budget of a hosted connector by ${servedSchemaBytes - CONNECTOR_DEFINITION_BUDGET} bytes. ` +
+        `Such a connector admits tools alphabetically, so the tail of the alphabet will be silently omitted. ` +
+        remedy
+    );
+  }
+
+  if (budget !== undefined && prunedForBudget.length > 0) {
+    const saved = prunedForBudget.reduce((n, p) => n + (p.bytesBefore - p.bytesAfter), 0);
+    const stillOver = prunedForBudget.filter((p) => p.bytesAfter > budget);
+    logger.info(
+      `Body schemas trimmed on ${prunedForBudget.length} tools to fit the ${budget}-byte definition budget, saving ${saved} bytes: ` +
+        prunedForBudget
+          .map(
+            (p) =>
+              `${p.toolName}(d${p.depth}/desc${p.describeDepth} ${p.bytesBefore}->${p.bytesAfter})`
+          )
+          .join(', ')
+    );
+
+    // Losing field names is the only outcome that leaves a model guessing what the body
+    // accepts, so it is reported separately from ordinary depth trimming.
+    const opaque = prunedForBudget.filter((p) => p.bodyWentOpaque);
+    if (opaque.length > 0) {
+      logger.warn(
+        `${opaque.length} tools had their body collapsed to an open object, so callers see no field names: ` +
+          opaque.map((p) => p.toolName).join(', ') +
+          `. Raise MS365_MCP_TOOL_DEFINITION_BUDGET to keep their schemas.`
+      );
+    }
+
+    if (stillOver.length > 0) {
+      // Registered anyway - a working oversized tool beats a missing one. Overshooting
+      // the per-tool ration is not itself fatal; it eats into the connector total, which
+      // the aggregate line above is what actually reports on.
+      logger.warn(
+        `${stillOver.length} tools remain above the ${budget}-byte ration at minimum depth and spend more of the connector budget than planned: ` +
+          stillOver.map((p) => `${p.toolName}(${p.bytesAfter})`).join(', ')
+      );
+    }
+  }
 }
 
 export function buildToolsRegistry(
   readOnly: boolean,
-  orgMode: boolean,
+  mode: boolean | ScopeMode,
   enabledToolsRegex?: RegExp,
   allowedScopesValue?: string,
   disabledByAllowedScopes: Array<{ toolName: string; missingScopes: string[] }> = []
@@ -1458,7 +4452,7 @@ export function buildToolsRegistry(
   for (const tool of allEndpoints) {
     const endpointConfig = endpointsData.find((e) => e.toolName === tool.alias);
 
-    if (!orgMode && endpointConfig && !endpointConfig.scopes && endpointConfig.workScopes) {
+    if (!isEndpointInScopeMode(endpointConfig, mode)) {
       continue;
     }
 
@@ -1477,7 +4471,7 @@ export function buildToolsRegistry(
       allowedScopes !== undefined && !endpointConfig
         ? ['endpoint scope metadata']
         : getMissingAllowedScopesForGroups(
-            getEndpointScopeGroups(endpointConfig, orgMode),
+            getEndpointScopeGroups(endpointConfig, mode),
             allowedScopes
           );
     if (missingScopes.length > 0) {
@@ -1589,17 +4583,36 @@ export function scoreDiscoveryQuery(
   return ranked;
 }
 
+/** Validate configured names before HTTP listeners start; retained at registration for direct callers. */
+export function validateEagerToolNames(names: readonly string[]): void {
+  const knownNames = new Set([
+    ...allEndpoints.map((t) => t.alias),
+    ...UTILITY_TOOLS.map((t) => t.name),
+  ]);
+  const unknown = names.filter((name) => !knownNames.has(name));
+  if (unknown.length > 0) throw new Error(`Unknown eager tool names: ${unknown.join(', ')}`);
+}
+
 export function registerDiscoveryTools(
   server: McpServer,
   graphClient: GraphClient,
-  readOnly: boolean = false,
-  orgMode: boolean = false,
-  authManager?: AuthManager,
-  multiAccount: boolean = false,
-  accountNames: string[] = [],
-  enabledTools?: string,
-  allowedScopesValue?: string
+  options: GraphToolRegistrationOptions = {}
 ): void {
+  const {
+    readOnly = false,
+    enabledTools,
+    orgMode = false,
+    appMode = false,
+    authManager,
+    multiAccount = false,
+    accountNames = [],
+    allowedScopes: allowedScopesValue,
+    httpMode = false,
+    userFields: userFieldsValue,
+  } = options;
+  const eagerNames = new Set(options.eagerTools ?? []);
+  validateEagerToolNames([...eagerNames]);
+  const userFields = parseUserFields(userFieldsValue);
   let enabledToolsRegex: RegExp | undefined;
   if (enabledTools) {
     try {
@@ -1613,9 +4626,17 @@ export function registerDiscoveryTools(
   }
 
   const disabledByAllowedScopes: Array<{ toolName: string; missingScopes: string[] }> = [];
+  const scopeMode = scopeModeFor({ orgMode, appMode });
+  const deniedTools = collectDeniedToolPolicies({
+    readOnly,
+    scopeMode,
+    enabledToolsRegex,
+    allowedScopesValue,
+    httpMode,
+  });
   const toolsRegistry = buildToolsRegistry(
     readOnly,
-    orgMode,
+    scopeMode,
     enabledToolsRegex,
     allowedScopesValue,
     disabledByAllowedScopes
@@ -1626,10 +4647,36 @@ export function registerDiscoveryTools(
     );
   }
   const utilityTools = UTILITY_TOOLS.filter((u) => {
-    if (readOnly && !u.readOnlyHint) return false;
+    if (!isUtilityToolAvailable(u, { readOnly, httpMode, scopeMode })) return false;
     if (enabledToolsRegex && !enabledToolsRegex.test(u.name)) return false;
     return true;
   });
+  // Eager selection changes presentation only. The discovery catalogue remains complete,
+  // and the existing availability filters run before either execution path is exposed.
+  for (const name of eagerNames) {
+    try {
+      const entry = toolsRegistry.get(name);
+      if (entry) {
+        registerGraphToolWithMcp(server, entry.tool, entry.config, graphClient, options);
+        continue;
+      }
+      const utility = utilityTools.find((tool) => tool.name === name);
+      if (utility) {
+        registerUtilityToolWithMcp(server, utility, {
+          graphClient,
+          authManager,
+          multiAccount,
+          accountNames,
+          userFields,
+        });
+        continue;
+      }
+      if (options.onUnavailableEagerTool) options.onUnavailableEagerTool(name);
+      else logger.info(`Eager tool ${name} is unavailable under the current filters or transport`);
+    } catch (error) {
+      logger.error(`Failed to register eager tool ${name}: ${(error as Error).message}`);
+    }
+  }
   const searchIndex = buildDiscoverySearchIndex(toolsRegistry, utilityTools);
   const totalCount = toolsRegistry.size + utilityTools.length;
   logger.info(
@@ -1641,6 +4688,7 @@ export function registerDiscoveryTools(
     authManager,
     multiAccount,
     accountNames,
+    userFields,
   };
   const utilityByName = new Map(utilityTools.map((u) => [u.name, u]));
 
@@ -1680,12 +4728,12 @@ export function registerDiscoveryTools(
     {
       query: z
         .string()
+        .optional()
         .describe(
           'Natural-language query. Tokenized and BM25-ranked. E.g. "send email", "download photo", "list unread messages".'
-        )
-        .optional(),
-      category: z.string().describe(`Optional pre-filter by category: ${categoryNames}`).optional(),
-      limit: z.number().describe('Maximum results (default: 10, max: 50)').optional(),
+        ),
+      category: z.string().optional().describe(`Optional pre-filter by category: ${categoryNames}`),
+      limit: z.number().optional().describe('Maximum results (default: 10, max: 50)'),
     },
     {
       title: 'search-tools',
@@ -1743,11 +4791,7 @@ export function registerDiscoveryTools(
     async ({ tool_name }) => {
       const entry = toolsRegistry.get(tool_name);
       if (entry) {
-        const schema = describeToolSchema(
-          entry.tool,
-          entry.config?.llmTip,
-          entry.config?.descriptionOverride
-        );
+        const schema = describeToolSchema(entry.tool, entry.config, { multiAccount, accountNames });
         return {
           content: [{ type: 'text', text: JSON.stringify(schema, null, 2) }],
         };
@@ -1780,11 +4824,11 @@ export function registerDiscoveryTools(
     {
       tool_name: z.string().describe('Name of the tool to execute (e.g., "list-mail-messages")'),
       parameters: z
-        .record(z.any())
+        .record(z.string(), z.any())
+        .optional()
         .describe(
           'Parameters shaped per get-tool-schema. Path/query/header params go at the top level; request bodies go under "body".'
-        )
-        .optional(),
+        ),
     },
     {
       title: 'execute-tool',
@@ -1800,12 +4844,17 @@ export function registerDiscoveryTools(
           toolData.config,
           graphClient,
           parameters,
-          authManager
+          authManager,
+          userFields
         );
       }
       const utility = utilityByName.get(tool_name);
       if (utility) {
-        return utility.execute(parameters, utilityCtx);
+        return executeUtilityTool(utility, utilityCtx, parameters);
+      }
+      const deniedPolicy = deniedTools.get(tool_name);
+      if (deniedPolicy) {
+        auditToolDenied(deniedPolicy, parameters);
       }
       return {
         content: [
@@ -1821,6 +4870,8 @@ export function registerDiscoveryTools(
       };
     }
   );
+
+  installDeniedToolAuditHandler(server, deniedTools);
 
   // Layer 3 (list-accounts) is registered by registerAuthTools — no duplicate here.
 }
